@@ -10,13 +10,18 @@ const { Pool } = require('pg')
 const app = express()
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 
-// Middleware
-app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }))
+app.set('trust proxy', 1)
+
+app.use(cors({
+  origin: process.env.CLIENT_URL,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}))
 app.use(express.json())
 app.use(cookieParser())
 app.use(passport.initialize())
 
-// Crear tablas si no existen
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -46,7 +51,6 @@ async function initDB() {
   console.log('Base de datos lista ✅')
 }
 
-// Google OAuth Strategy
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -67,14 +71,22 @@ passport.use(new GoogleStrategy({
   }
 }))
 
-// Auth routes
 app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false }))
 
 app.get('/auth/google/callback',
-  passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}/login?error=true` }),
+  passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}?error=true` }),
   (req, res) => {
-    const token = jwt.sign({ id: req.user.id, email: req.user.email }, process.env.JWT_SECRET, { expiresIn: '7d' })
-    res.cookie('token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 })
+    const token = jwt.sign(
+      { id: req.user.id, email: req.user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    )
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    })
     res.redirect(process.env.CLIENT_URL)
   }
 )
@@ -85,11 +97,10 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
 })
 
 app.post('/auth/logout', (req, res) => {
-  res.clearCookie('token')
+  res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'none' })
   res.json({ ok: true })
 })
 
-// Middleware JWT
 function authenticateToken(req, res, next) {
   const token = req.cookies.token
   if (!token) return res.status(401).json({ error: 'No autorizado' })
@@ -101,7 +112,6 @@ function authenticateToken(req, res, next) {
   }
 }
 
-// Ramos routes
 app.get('/ramos', authenticateToken, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT r.*, json_agg(e ORDER BY e.id) as evaluaciones
