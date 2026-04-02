@@ -1,0 +1,150 @@
+require('dotenv').config()
+const express = require('express')
+const cors = require('cors')
+const cookieParser = require('cookie-parser')
+const passport = require('passport')
+const { Strategy: GoogleStrategy } = require('passport-google-oauth20')
+const jwt = require('jsonwebtoken')
+const { Pool } = require('pg')
+
+const app = express()
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+
+// Middleware
+app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }))
+app.use(express.json())
+app.use(cookieParser())
+app.use(passport.initialize())
+
+// Crear tablas si no existen
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id SERIAL PRIMARY KEY,
+      google_id VARCHAR(255) UNIQUE NOT NULL,
+      nombre VARCHAR(255),
+      email VARCHAR(255),
+      avatar VARCHAR(500),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ramos (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      nombre VARCHAR(255) NOT NULL,
+      nota_minima DECIMAL(3,1) DEFAULT 4.0,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS evaluaciones (
+      id SERIAL PRIMARY KEY,
+      ramo_id INTEGER REFERENCES ramos(id) ON DELETE CASCADE,
+      nombre VARCHAR(255) NOT NULL,
+      ponderacion INTEGER NOT NULL,
+      nota DECIMAL(3,1),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `)
+  console.log('Base de datos lista ✅')
+}
+
+// Google OAuth Strategy
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO usuarios (google_id, nombre, email, avatar)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (google_id) DO UPDATE
+       SET nombre = $2, avatar = $4
+       RETURNING *`,
+      [profile.id, profile.displayName, profile.emails[0].value, profile.photos[0].value]
+    )
+    return done(null, rows[0])
+  } catch (err) {
+    return done(err)
+  }
+}))
+
+// Auth routes
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false }))
+
+app.get('/auth/google/callback',
+  passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}/login?error=true` }),
+  (req, res) => {
+    const token = jwt.sign({ id: req.user.id, email: req.user.email }, process.env.JWT_SECRET, { expiresIn: '7d' })
+    res.cookie('token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 })
+    res.redirect(process.env.CLIENT_URL)
+  }
+)
+
+app.get('/auth/me', authenticateToken, async (req, res) => {
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar FROM usuarios WHERE id = $1', [req.user.id])
+  res.json(rows[0])
+})
+
+app.post('/auth/logout', (req, res) => {
+  res.clearCookie('token')
+  res.json({ ok: true })
+})
+
+// Middleware JWT
+function authenticateToken(req, res, next) {
+  const token = req.cookies.token
+  if (!token) return res.status(401).json({ error: 'No autorizado' })
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET)
+    next()
+  } catch {
+    res.status(401).json({ error: 'Token inválido' })
+  }
+}
+
+// Ramos routes
+app.get('/ramos', authenticateToken, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT r.*, json_agg(e ORDER BY e.id) as evaluaciones
+     FROM ramos r
+     LEFT JOIN evaluaciones e ON e.ramo_id = r.id
+     WHERE r.usuario_id = $1
+     GROUP BY r.id ORDER BY r.created_at DESC`,
+    [req.user.id]
+  )
+  res.json(rows)
+})
+
+app.post('/ramos', authenticateToken, async (req, res) => {
+  const { nombre, nota_minima, evaluaciones } = req.body
+  const { rows } = await pool.query(
+    'INSERT INTO ramos (usuario_id, nombre, nota_minima) VALUES ($1, $2, $3) RETURNING *',
+    [req.user.id, nombre, nota_minima]
+  )
+  const ramo = rows[0]
+  for (const e of evaluaciones) {
+    await pool.query(
+      'INSERT INTO evaluaciones (ramo_id, nombre, ponderacion, nota) VALUES ($1, $2, $3, $4)',
+      [ramo.id, e.nombre, e.ponderacion, e.nota || null]
+    )
+  }
+  res.json(ramo)
+})
+
+app.put('/ramos/:id', authenticateToken, async (req, res) => {
+  const { evaluaciones } = req.body
+  for (const e of evaluaciones) {
+    await pool.query('UPDATE evaluaciones SET nota = $1 WHERE id = $2', [e.nota || null, e.id])
+  }
+  res.json({ ok: true })
+})
+
+app.delete('/ramos/:id', authenticateToken, async (req, res) => {
+  await pool.query('DELETE FROM ramos WHERE id = $1 AND usuario_id = $2', [req.params.id, req.user.id])
+  res.json({ ok: true })
+})
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }))
+
+initDB().then(() => {
+  app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
+})
