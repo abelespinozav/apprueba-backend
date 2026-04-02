@@ -36,7 +36,7 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
       nombre VARCHAR(255) NOT NULL,
-      nota_minima DECIMAL(3,1) DEFAULT 4.0,
+      min_aprobacion DECIMAL(3,1) DEFAULT 4.0,
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS evaluaciones (
@@ -93,7 +93,9 @@ app.get('/auth/google/callback',
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
   const { rows } = await pool.query('SELECT id, nombre, email, avatar FROM usuarios WHERE id = $1', [req.user.id])
-  res.json(rows[0])
+  if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
+  const u = rows[0]
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar } })
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -125,10 +127,10 @@ app.get('/ramos', authenticateToken, async (req, res) => {
 })
 
 app.post('/ramos', authenticateToken, async (req, res) => {
-  const { nombre, nota_minima, evaluaciones } = req.body
+  const { nombre, minAprobacion, evaluaciones } = req.body
   const { rows } = await pool.query(
-    'INSERT INTO ramos (usuario_id, nombre, nota_minima) VALUES ($1, $2, $3) RETURNING *',
-    [req.user.id, nombre, nota_minima]
+    'INSERT INTO ramos (usuario_id, nombre, min_aprobacion) VALUES ($1, $2, $3) RETURNING *',
+    [req.user.id, nombre, minAprobacion || 4.0]
   )
   const ramo = rows[0]
   for (const e of evaluaciones) {
@@ -137,14 +139,20 @@ app.post('/ramos', authenticateToken, async (req, res) => {
       [ramo.id, e.nombre, e.ponderacion, e.nota || null]
     )
   }
-  res.json(ramo)
+  const { rows: ramoCompleto } = await pool.query(
+    `SELECT r.*, json_agg(e ORDER BY e.id) as evaluaciones
+     FROM ramos r
+     LEFT JOIN evaluaciones e ON e.ramo_id = r.id
+     WHERE r.id = $1
+     GROUP BY r.id`,
+    [ramo.id]
+  )
+  res.json(ramoCompleto[0])
 })
 
-app.put('/ramos/:id', authenticateToken, async (req, res) => {
-  const { evaluaciones } = req.body
-  for (const e of evaluaciones) {
-    await pool.query('UPDATE evaluaciones SET nota = $1 WHERE id = $2', [e.nota || null, e.id])
-  }
+app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
+  const { nota } = req.body
+  await pool.query('UPDATE evaluaciones SET nota = $1 WHERE id = $2', [nota || null, req.params.id])
   res.json({ ok: true })
 })
 
