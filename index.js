@@ -273,3 +273,18 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }))
 initDB().then(() => {
   app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
 })
+
+// Actualizar progreso del plan
+app.put('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) => {
+  try {
+    const { tareas_completadas } = req.body
+    await pool.query(
+      'UPDATE evaluaciones SET tareas_completadas = $1 WHERE id = $2',
+      [tareas_completadas, req.params.id]
+    )
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Error actualizando progreso:', err)
+    res.status(500).json({ error: 'Error al actualizar progreso' })
+  }
+})
