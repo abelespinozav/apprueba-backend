@@ -231,7 +231,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, async (req, res) =
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
     let prompt = `Eres un tutor universitario experto. Crea un plan de estudio detallado para un estudiante universitario chileno.
 
