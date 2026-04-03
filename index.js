@@ -291,3 +291,61 @@ app.put('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) =
     res.status(500).json({ error: 'Error al actualizar progreso' })
   }
 })
+
+// Generar guía de estudio para una tarea específica
+app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => {
+  try {
+    const { tarea } = req.body
+    const { rows: evRows } = await pool.query(
+      `SELECT e.*, r.nombre as ramo_nombre,
+        (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
+         FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
+       FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
+       WHERE e.id = $1`,
+      [req.params.id]
+    )
+    if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
+    const ev = evRows[0]
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+
+    let contenidoArchivos = ''
+    if (ev.archivos && ev.archivos.length > 0) {
+      contenidoArchivos = `\nEl estudiante ha subido los siguientes archivos de estudio: ${ev.archivos.map(a => a.nombre).join(', ')}. Usa estos temas como contexto.`
+    }
+
+    const prompt = `Eres un tutor universitario experto. Genera una guía de estudio detallada para un estudiante universitario chileno.
+
+Ramo: ${ev.ramo_nombre}
+Evaluación: ${ev.nombre}
+Tarea a estudiar: ${tarea.titulo}
+Descripción: ${tarea.descripcion}${contenidoArchivos}
+
+Responde SOLO con un JSON válido (sin markdown, sin bloques de código):
+{
+  "titulo": "título de la guía",
+  "introduccion": "párrafo introductorio del tema",
+  "conceptos_clave": [
+    { "termino": "nombre del concepto", "definicion": "explicación clara y concisa" }
+  ],
+  "desarrollo": "explicación detallada del tema en 3-4 párrafos",
+  "ejemplos": [
+    { "enunciado": "enunciado del ejemplo", "solucion": "solución paso a paso" }
+  ],
+  "ejercicios_practica": [
+    { "enunciado": "enunciado del ejercicio", "pista": "pista para resolverlo" }
+  ],
+  "resumen_final": "resumen en 2-3 puntos clave para recordar"
+}
+
+Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
+
+    const result = await model.generateContent(prompt)
+    const text = result.response.text()
+    const jsonMatch = text.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
+    res.json(JSON.parse(jsonMatch[0]))
+  } catch (err) {
+    console.error('Error generando guía:', err)
+    res.status(500).json({ error: 'Error al generar guía de estudio' })
+  }
+})
