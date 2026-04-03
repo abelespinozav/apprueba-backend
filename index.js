@@ -239,13 +239,16 @@ Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre} (${ev.ponderacion}% del ramo)
 ${ev.fecha ? `Fecha de evaluación: ${ev.fecha}` : ''}
 
-Responde SOLO con un JSON válido con esta estructura exacta:
+Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin bloques de código):
 {
   "resumen": "descripción breve del plan en 1-2 oraciones",
-  "tareas": ["tarea 1", "tarea 2", "tarea 3", "tarea 4", "tarea 5"]
+  "tareas": [
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "alta", "duracion": 45, "fecha": "" },
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "media", "duracion": 30, "fecha": "" }
+  ]
 }
 
-Las tareas deben ser específicas, accionables y útiles para preparar esta evaluación.`
+Genera 5 tareas. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha puede ser string vacío.`
 
     const result = await model.generateContent(prompt)
     const text = result.response.text()
