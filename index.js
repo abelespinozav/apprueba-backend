@@ -292,10 +292,10 @@ app.put('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) =
   }
 })
 
-// Generar guía de estudio para una tarea específica
+// Generar o recuperar guía de estudio para una tarea específica
 app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => {
   try {
-    const { tarea } = req.body
+    const { tarea, tareaIndex, forzar } = req.body
     const { rows: evRows } = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre,
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
@@ -306,8 +306,15 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
     )
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
+    // Si ya existe la guía y no se fuerza regenerar, devolverla
+    const guiasGuardadas = ev.guias_tareas || {}
+    const key = String(tareaIndex)
+    if (guiasGuardadas[key] && !forzar) {
+      return res.json({ ...guiasGuardadas[key], cached: true })
+    }
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
     let contenidoArchivos = ''
     if (ev.archivos && ev.archivos.length > 0) {
       contenidoArchivos = `\nEl estudiante ha subido los siguientes archivos de estudio: ${ev.archivos.map(a => a.nombre).join(', ')}. Usa estos temas como contexto.`
@@ -343,7 +350,13 @@ Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
     const text = result.response.text()
     const jsonMatch = text.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
-    res.json(JSON.parse(jsonMatch[0]))
+    const guia = JSON.parse(jsonMatch[0])
+
+    // Guardar guía en DB
+    guiasGuardadas[key] = guia
+    await pool.query('UPDATE evaluaciones SET guias_tareas = $1 WHERE id = $2', [JSON.stringify(guiasGuardadas), req.params.id])
+
+    res.json(guia)
   } catch (err) {
     console.error('Error generando guía:', err)
     res.status(500).json({ error: 'Error al generar guía de estudio' })
