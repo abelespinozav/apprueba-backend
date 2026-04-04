@@ -234,7 +234,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, async (req, res) =
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre} (${ev.ponderacion}% del ramo)
 ${ev.fecha ? `Fecha de evaluación: ${ev.fecha}` : ''}
-${ev.archivos && ev.archivos.length > 0 ? `El estudiante ha subido material de estudio. Analiza su contenido y basa el plan EXCLUSIVAMENTE en ese material.` : ''}
+${ev.archivos && ev.archivos.length > 0 ? `El estudiante ha subido material de estudio. Analiza su contenido y basa el plan en ese material.` : ''}
 
 Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin bloques de código):
 {
@@ -269,12 +269,16 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       return res.json(plan)
     } catch(geminiErr) {
       console.error('Gemini error con archivo:', geminiErr.message)
-      // Fallback: generar sin archivo
-      const fallback = await model.generateContent([{ text: promptText }])
+      // Fallback: generar con nombres de archivos como contexto
+      const promptConArchivos = promptText + (ev.archivos && ev.archivos.length > 0 
+        ? `\nEl estudiante ha subido el siguiente material: ${ev.archivos.map(a => a.nombre).join(', ')}. Genera el plan basándote en los temas que sugieren esos nombres de archivo, independiente del nombre del ramo.`
+        : '')
+      const fallback = await model.generateContent([{ text: promptConArchivos }])
       const text2 = fallback.response.text()
       const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
       if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
       const plan2 = JSON.parse(jsonMatch2[0])
+      plan2._archivoNoProcessado = true
       await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), req.params.id])
       return res.json(plan2)
     }
