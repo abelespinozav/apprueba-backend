@@ -442,3 +442,18 @@ Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
     res.status(500).json({ error: 'Error al generar guía de estudio' })
   }
 })
+
+// Ruta PATCH para actualizar nota (usada por el frontend)
+app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
+  try {
+    const { nota } = req.body
+    await pool.query(
+      'UPDATE evaluaciones SET nota = $1 WHERE id = $2',
+      [nota || null, req.params.evalId]
+    )
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Error actualizando nota:', err)
+    res.status(500).json({ error: 'Error al actualizar nota' })
+  }
+})
