@@ -221,8 +221,8 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, async (req, res) =
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
          FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
        FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
-       WHERE e.id = $1`,
-      [req.params.id]
+       WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
     )
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
@@ -297,8 +297,8 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
          FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
        FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
-       WHERE e.id = $1`,
-      [req.params.id]
+       WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
     )
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
