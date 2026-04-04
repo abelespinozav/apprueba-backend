@@ -9,6 +9,7 @@ const { Pool } = require('pg')
 const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const pdfParse = require('pdf-parse')
+const bcrypt = require('bcrypt')
 
 const app = express()
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
@@ -31,10 +32,11 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
-      google_id VARCHAR(255) UNIQUE NOT NULL,
+      google_id VARCHAR(255) UNIQUE,
       nombre VARCHAR(255),
-      email VARCHAR(255),
+      email VARCHAR(255) UNIQUE,
       avatar VARCHAR(500),
+      password_hash VARCHAR(255),
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS ramos (
@@ -86,6 +88,46 @@ passport.use(new GoogleStrategy({
     return done(err)
   }
 }))
+
+// Registro con email/contraseña
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { nombre, email, password } = req.body
+    if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan campos' })
+    if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' })
+    const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email])
+    if (existe.rows.length > 0) return res.status(400).json({ error: 'El email ya está registrado' })
+    const hash = await bcrypt.hash(password, 10)
+    const result = await pool.query(
+      'INSERT INTO usuarios (nombre, email, password_hash) VALUES ($1, $2, $3) RETURNING id, nombre, email, avatar',
+      [nombre, email, hash]
+    )
+    const usuario = result.rows[0]
+    const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
+    res.json({ token, usuario })
+  } catch (err) {
+    console.error('Register error:', err)
+    res.status(500).json({ error: 'Error al registrar' })
+  }
+})
+
+// Login con email/contraseña
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body
+    if (!email || !password) return res.status(400).json({ error: 'Faltan campos' })
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1 AND password_hash IS NOT NULL', [email])
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Email o contraseña incorrectos' })
+    const usuario = result.rows[0]
+    const ok = await bcrypt.compare(password, usuario.password_hash)
+    if (!ok) return res.status(400).json({ error: 'Email o contraseña incorrectos' })
+    const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
+    res.json({ token, usuario: { id: usuario.id, nombre: usuario.nombre, email: usuario.email, avatar: usuario.avatar } })
+  } catch (err) {
+    console.error('Login error:', err)
+    res.status(500).json({ error: 'Error al iniciar sesión' })
+  }
+})
 
 app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false }))
 
@@ -250,6 +292,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
 
     // Extraer texto de los archivos
     let textoArchivos = ''
+    console.log('📎 Archivos encontrados:', ev.archivos ? ev.archivos.length : 0)
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
         if (archivo.datos) {
@@ -257,6 +300,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
             const buffer = Buffer.from(archivo.datos, 'base64')
             if (archivo.tipo && archivo.tipo.includes('pdf')) {
               const parsed = await pdfParse(buffer)
+              console.log(`📄 Texto extraído de ${archivo.nombre}: ${parsed.text.slice(0,200)}`)
               textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${parsed.text.slice(0, 8000)}`
             } else {
               textoArchivos += `\n\n--- Archivo: ${archivo.nombre} ---`
