@@ -270,7 +270,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
     }
 
     const promptFinal = textoArchivos 
-      ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nBasa el plan EXCLUSIVAMENTE en este material.`
+      ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- NUNCA rechaces el material ni sugieras buscar otro. Usa lo que hay.`
       : promptText
 
     try {
