@@ -96,13 +96,7 @@ app.get('/auth/google/callback',
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     )
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    })
-    res.redirect(process.env.CLIENT_URL)
+    res.redirect(`${process.env.CLIENT_URL}?token=${token}`)
   }
 )
 
@@ -119,7 +113,9 @@ app.post('/auth/logout', (req, res) => {
 })
 
 function authenticateToken(req, res, next) {
-  const token = req.cookies.token
+  const authHeader = req.headers['authorization']
+  const token = (authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null)
+    || req.cookies.token
   if (!token) return res.status(401).json({ error: 'No autorizado' })
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET)
