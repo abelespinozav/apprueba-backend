@@ -251,20 +251,34 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
         if (archivo.datos) {
-          parts.push({ inlineData: { mimeType: archivo.tipo || 'application/pdf', data: archivo.datos } })
+          // datos ya viene en base64 desde PostgreSQL encode()
+          const b64 = typeof archivo.datos === 'string' ? archivo.datos : Buffer.from(archivo.datos).toString('base64')
+          parts.push({ inlineData: { mimeType: archivo.tipo || 'application/pdf', data: b64 } })
         }
       }
     }
     parts.push({ text: promptText })
 
-    const result = await model.generateContent(parts)
-    const text = result.response.text()
-    const jsonMatch = text.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
-    const plan = JSON.parse(jsonMatch[0])
+    try {
+      const result = await model.generateContent(parts)
+      const text = result.response.text()
+      const jsonMatch = text.match(/\{[\s\S]*\}/)
+      if (!jsonMatch) throw new Error('No JSON')
+      const plan = JSON.parse(jsonMatch[0])
+      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan), req.params.id])
+      return res.json(plan)
+    } catch(geminiErr) {
+      console.error('Gemini error con archivo:', geminiErr.message)
+      // Fallback: generar sin archivo
+      const fallback = await model.generateContent([{ text: promptText }])
+      const text2 = fallback.response.text()
+      const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
+      if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
+      const plan2 = JSON.parse(jsonMatch2[0])
+      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), req.params.id])
+      return res.json(plan2)
+    }
 
-    await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan), req.params.id])
-    res.json(plan)
   } catch (err) {
     console.error('Error generando plan:', err)
     res.status(500).json({ error: 'Error al generar plan de estudio' })
