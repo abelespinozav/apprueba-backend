@@ -229,11 +229,12 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, async (req, res) =
 
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
-    let prompt = `Eres un tutor universitario experto. Crea un plan de estudio detallado para un estudiante universitario chileno.
+    const promptText = `Eres un tutor universitario experto. Crea un plan de estudio detallado para un estudiante universitario chileno.
 
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre} (${ev.ponderacion}% del ramo)
 ${ev.fecha ? `Fecha de evaluación: ${ev.fecha}` : ''}
+${ev.archivos && ev.archivos.length > 0 ? `El estudiante ha subido material de estudio. Analiza su contenido y basa el plan EXCLUSIVAMENTE en ese material.` : ''}
 
 Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin bloques de código):
 {
@@ -244,9 +245,19 @@ Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin 
   ]
 }
 
-Genera 5 tareas. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha puede ser string vacío.`
+Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha puede ser string vacío.`
 
-    const result = await model.generateContent(prompt)
+    const parts = []
+    if (ev.archivos && ev.archivos.length > 0) {
+      for (const archivo of ev.archivos) {
+        if (archivo.datos) {
+          parts.push({ inlineData: { mimeType: archivo.tipo || 'application/pdf', data: archivo.datos } })
+        }
+      }
+    }
+    parts.push({ text: promptText })
+
+    const result = await model.generateContent(parts)
     const text = result.response.text()
     const jsonMatch = text.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
