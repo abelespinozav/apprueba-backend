@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken')
 const { Pool } = require('pg')
 const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
+const pdfParse = require('pdf-parse')
 
 const app = express()
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
@@ -247,20 +248,33 @@ Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin 
 
 Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha puede ser string vacío.`
 
-    const parts = []
+    // Extraer texto de los archivos
+    let textoArchivos = ''
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
         if (archivo.datos) {
-          // datos ya viene en base64 desde PostgreSQL encode()
-          const b64 = typeof archivo.datos === 'string' ? archivo.datos : Buffer.from(archivo.datos).toString('base64')
-          parts.push({ inlineData: { mimeType: archivo.tipo || 'application/pdf', data: b64 } })
+          try {
+            const buffer = Buffer.from(archivo.datos, 'base64')
+            if (archivo.tipo && archivo.tipo.includes('pdf')) {
+              const parsed = await pdfParse(buffer)
+              textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${parsed.text.slice(0, 8000)}`
+            } else {
+              textoArchivos += `\n\n--- Archivo: ${archivo.nombre} ---`
+            }
+          } catch(e) {
+            console.error('Error extrayendo texto:', e.message)
+            textoArchivos += `\n\n--- Archivo: ${archivo.nombre} (no se pudo extraer texto) ---`
+          }
         }
       }
     }
-    parts.push({ text: promptText })
+
+    const promptFinal = textoArchivos 
+      ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nBasa el plan EXCLUSIVAMENTE en este material.`
+      : promptText
 
     try {
-      const result = await model.generateContent(parts)
+      const result = await model.generateContent([{ text: promptFinal }])
       const text = result.response.text()
       const jsonMatch = text.match(/\{[\s\S]*\}/)
       if (!jsonMatch) throw new Error('No JSON')
@@ -268,17 +282,14 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan), req.params.id])
       return res.json(plan)
     } catch(geminiErr) {
-      console.error('Gemini error con archivo:', geminiErr.message)
-      // Fallback: generar con nombres de archivos como contexto
-      const promptConArchivos = promptText + (ev.archivos && ev.archivos.length > 0 
-        ? `\nEl estudiante ha subido el siguiente material: ${ev.archivos.map(a => a.nombre).join(', ')}. Genera el plan basándote en los temas que sugieren esos nombres de archivo, independiente del nombre del ramo.`
-        : '')
-      const fallback = await model.generateContent([{ text: promptConArchivos }])
+      console.error('Gemini error:', geminiErr.message)
+      // Fallback: reintentar con texto plano
+      const fallback = await model.generateContent([{ text: promptFinal }])
       const text2 = fallback.response.text()
       const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
       if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
       const plan2 = JSON.parse(jsonMatch2[0])
-      plan2._archivoNoProcessado = true
+      if (!textoArchivos) plan2._archivoNoProcessado = true
       await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), req.params.id])
       return res.json(plan2)
     }
