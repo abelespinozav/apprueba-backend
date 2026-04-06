@@ -8,11 +8,19 @@ const jwt = require('jsonwebtoken')
 const { Pool } = require('pg')
 const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
+const webpush = require('web-push')
+const cron = require('node-cron')
 const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
 const bcrypt = require('bcrypt')
 
 const app = express()
+
+webpush.setVapidDetails(
+  'mailto:abelespinozav@gmail.com',
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+)
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
@@ -388,6 +396,130 @@ app.get('/admin/stats', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
+
+// ── NOTIFICACIONES PUSH ──────────────────────────────────────────
+
+// Guardar subscription del navegador
+app.post('/notificaciones/subscribe', authenticateToken, async (req, res) => {
+  try {
+    const { subscription } = req.body
+    await pool.query(
+      `INSERT INTO push_subscriptions (usuario_id, subscription)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [req.user.id, JSON.stringify(subscription)]
+    )
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+// Obtener config de notificaciones del usuario
+app.get('/notificaciones/config', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM notificacion_config WHERE usuario_id = $1',
+      [req.user.id]
+    )
+    if (rows.length === 0) {
+      res.json({ dias_antes: [1, 2, 5], activo: true })
+    } else {
+      res.json(rows[0])
+    }
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+// Guardar config de notificaciones
+app.post('/notificaciones/config', authenticateToken, async (req, res) => {
+  try {
+    const { dias_antes, activo } = req.body
+    if (!Array.isArray(dias_antes) || dias_antes.length > 3) {
+      return res.status(400).json({ error: 'Máximo 3 recordatorios' })
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO notificacion_config (usuario_id, dias_antes, activo)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (usuario_id) DO UPDATE
+       SET dias_antes = $2, activo = $3
+       RETURNING *`,
+      [req.user.id, dias_antes, activo]
+    )
+    res.json(rows[0])
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+// Endpoint para obtener la VAPID public key
+app.get('/notificaciones/vapid-key', (req, res) => {
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY })
+})
+
+// ── CRON JOB — todos los días a las 9:00 AM Chile (UTC-3) ────────
+cron.schedule('0 12 * * *', async () => {
+  console.log('🔔 Cron notificaciones ejecutándose...')
+  try {
+    // Obtener todas las evaluaciones con fecha futura y sus configs
+    const { rows: configs } = await pool.query(`
+      SELECT
+        nc.usuario_id,
+        nc.dias_antes,
+        u.nombre as usuario_nombre,
+        e.nombre as eval_nombre,
+        e.fecha,
+        r.nombre as ramo_nombre,
+        e.ponderacion
+      FROM notificacion_config nc
+      JOIN usuarios u ON u.id = nc.usuario_id
+      JOIN ramos r ON r.usuario_id = nc.usuario_id
+      JOIN evaluaciones e ON e.ramo_id = r.id
+      WHERE nc.activo = true
+        AND e.fecha IS NOT NULL
+        AND e.nota IS NULL
+        AND e.fecha >= CURRENT_DATE
+    `)
+
+    for (const row of configs) {
+      const fecha = new Date(row.fecha)
+      const hoy = new Date()
+      hoy.setHours(0,0,0,0)
+      const diffDias = Math.round((fecha - hoy) / (1000 * 60 * 60 * 24))
+
+      if (row.dias_antes.includes(diffDias)) {
+        // Obtener subscriptions del usuario
+        const { rows: subs } = await pool.query(
+          'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+          [row.usuario_id]
+        )
+
+        const mensaje = diffDias === 0
+          ? `¡Hoy es ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)!`
+          : diffDias === 1
+          ? `Mañana tienes ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
+          : `En ${diffDias} días: ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
+
+        for (const sub of subs) {
+          try {
+            await webpush.sendNotification(
+              sub.subscription,
+              JSON.stringify({
+                title: '📚 APPrueba',
+                body: mensaje,
+                icon: '/icon-192.png'
+              })
+            )
+          } catch(e) {
+            if (e.statusCode === 410) {
+              // Subscription expirada, eliminar
+              await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
+            }
+          }
+        }
+      }
+    }
+    console.log('✅ Cron notificaciones completado')
+  } catch(err) {
+    console.error('❌ Error cron notificaciones:', err.message)
+  }
+}, { timezone: 'America/Santiago' })
 
 app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
 })
