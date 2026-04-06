@@ -60,6 +60,13 @@ async function initDB() {
       min_aprobacion DECIMAL(3,1) DEFAULT 4.0,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_examen DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_final DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS estado_final VARCHAR(50);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS ponderacion_examen INTEGER DEFAULT 25;
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_eximicion DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
     CREATE TABLE IF NOT EXISTS evaluaciones (
       id SERIAL PRIMARY KEY,
       ramo_id INTEGER REFERENCES ramos(id) ON DELETE CASCADE,
@@ -632,10 +639,10 @@ Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
 // Ruta PATCH para actualizar nota (usada por el frontend)
 app.put('/ramos/:id', authenticateToken, async (req, res) => {
   try {
-    const { nombre, min_aprobacion, evaluaciones } = req.body
+    const { nombre, min_aprobacion, evaluaciones, nota_examen, nota_final, estado_final, ponderacion_examen, nota_eximicion, condiciones_eximicion, sin_rojos } = req.body
     const ramoResult = await pool.query(
-      'UPDATE ramos SET nombre=$1, min_aprobacion=$2 WHERE id=$3 AND usuario_id=$4 RETURNING *',
-      [nombre, min_aprobacion, req.params.id, req.user.id]
+      'UPDATE ramos SET nombre=$1, min_aprobacion=$2, nota_examen=$3, nota_final=$4, estado_final=$5, ponderacion_examen=$6, nota_eximicion=$7, condiciones_eximicion=$8, sin_rojos=$9 WHERE id=$10 AND usuario_id=$11 RETURNING *',
+      [nombre, min_aprobacion, nota_examen||null, nota_final||null, estado_final||null, ponderacion_examen||25, nota_eximicion||null, condiciones_eximicion||null, sin_rojos||false, req.params.id, req.user.id]
     )
     if (ramoResult.rows.length === 0) return res.status(404).json({ error: 'Ramo no encontrado' })
     for (const e of evaluaciones) {
