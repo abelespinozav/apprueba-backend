@@ -633,12 +633,22 @@ Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
 app.put('/ramos/:id', authenticateToken, async (req, res) => {
   try {
     const { nombre, min_aprobacion, evaluaciones } = req.body
-    const result = await pool.query(
-      'UPDATE ramos SET nombre=$1, min_aprobacion=$2, evaluaciones=$3 WHERE id=$4 AND usuario_id=$5 RETURNING *',
-      [nombre, min_aprobacion, JSON.stringify(evaluaciones), req.params.id, req.user.id]
+    const ramoResult = await pool.query(
+      'UPDATE ramos SET nombre=$1, min_aprobacion=$2 WHERE id=$3 AND usuario_id=$4 RETURNING *',
+      [nombre, min_aprobacion, req.params.id, req.user.id]
     )
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Ramo no encontrado' })
-    res.json(result.rows[0])
+    if (ramoResult.rows.length === 0) return res.status(404).json({ error: 'Ramo no encontrado' })
+    for (const e of evaluaciones) {
+      await pool.query(
+        'UPDATE evaluaciones SET nota=$1, fecha=$2 WHERE id=$3 AND ramo_id=$4',
+        [e.nota || null, e.fecha || null, e.id, req.params.id]
+      )
+    }
+    const updated = await pool.query(
+      `SELECT r.*, json_agg(json_build_object('id',e.id,'nombre',e.nombre,'ponderacion',e.ponderacion,'nota',e.nota,'fecha',e.fecha) ORDER BY e.id) as evaluaciones FROM ramos r LEFT JOIN evaluaciones e ON e.ramo_id = r.id WHERE r.id=$1 GROUP BY r.id`,
+      [req.params.id]
+    )
+    res.json(updated.rows[0])
   } catch (e) { console.error(e); res.status(500).json({ error: e.message }) }
 })
 
