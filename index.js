@@ -9,6 +9,7 @@ const { Pool } = require('pg')
 const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const pdfParse = require('pdf-parse')
+const mammoth = require('mammoth')
 const bcrypt = require('bcrypt')
 
 const app = express()
@@ -302,8 +303,12 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
               const parsed = await pdfParse(buffer)
               console.log(`📄 Texto extraído de ${archivo.nombre}: ${parsed.text.slice(0,200)}`)
               textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${parsed.text.slice(0, 8000)}`
+            } else if (archivo.tipo && (archivo.tipo.includes('word') || archivo.tipo.includes('docx') || archivo.nombre?.endsWith('.docx'))) {
+              const result = await mammoth.extractRawText({ buffer })
+              console.log(`📝 Texto extraído de docx ${archivo.nombre}: ${result.value.slice(0,200)}`)
+              textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${result.value.slice(0, 8000)}`
             } else {
-              textoArchivos += `\n\n--- Archivo: ${archivo.nombre} ---`
+              textoArchivos += `\n\n--- Archivo: ${archivo.nombre} (formato no soportado) ---`
             }
           } catch(e) {
             console.error('Error extrayendo texto:', e.message)
