@@ -77,10 +77,10 @@ passport.use(new GoogleStrategy({
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     const { rows } = await pool.query(
-      `INSERT INTO usuarios (google_id, nombre, email, avatar)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO usuarios (google_id, nombre, email, avatar, last_login)
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (google_id) DO UPDATE
-       SET nombre = $2, avatar = $4
+       SET nombre = $2, avatar = $4, last_login = NOW()
        RETURNING *`,
       [profile.id, profile.displayName, profile.emails[0].value, profile.photos[0].value]
     )
@@ -359,7 +359,37 @@ app.post('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 
 initDB().then(() => {
-  app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
+  
+// Panel admin - solo abelespinozav@gmail.com
+app.get('/admin/stats', authenticateToken, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const usuarios = await pool.query(`
+      SELECT nombre, email, created_at, last_login
+      FROM usuarios
+      ORDER BY created_at DESC
+    `)
+    const stats = await pool.query(`
+      SELECT
+        COUNT(*) as total_usuarios,
+        COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as nuevos_7d,
+        COUNT(CASE WHEN last_login > NOW() - INTERVAL '7 days' THEN 1 END) as activos_7d
+      FROM usuarios
+    `)
+    const ramos = await pool.query('SELECT COUNT(*) as total_ramos FROM ramos')
+    const evals = await pool.query('SELECT COUNT(*) as total_evaluaciones FROM evaluaciones')
+    res.json({
+      stats: stats.rows[0],
+      ramos: ramos.rows[0].total_ramos,
+      evaluaciones: evals.rows[0].total_evaluaciones,
+      usuarios: usuarios.rows
+    })
+  } catch(err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
 })
 
 // Actualizar progreso del plan
