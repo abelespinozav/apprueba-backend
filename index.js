@@ -10,7 +10,6 @@ const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const webpush = require('web-push')
 const cron = require('node-cron')
-const webpush = require('web-push')
 const cron = require('node-cron')
 const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
@@ -24,11 +23,6 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 )
 
-webpush.setVapidDetails(
-  'mailto:abelespinozav@gmail.com',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-)
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
