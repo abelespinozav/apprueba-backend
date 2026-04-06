@@ -222,7 +222,7 @@ app.post('/ramos', authenticateToken, async (req, res) => {
     [req.user.id, nombre, minAprobacion || 4.0]
   )
   const ramo = rows[0]
-  for (const e of evaluaciones) {
+  for (const e of (evaluaciones || [])) {
     await pool.query(
       'INSERT INTO evaluaciones (ramo_id, nombre, ponderacion, nota, fecha) VALUES ($1, $2, $3, $4, $5)',
       [ramo.id, e.nombre, e.ponderacion, e.nota || null, e.fecha || null]
