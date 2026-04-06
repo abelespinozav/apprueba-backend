@@ -630,6 +630,18 @@ Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
 })
 
 // Ruta PATCH para actualizar nota (usada por el frontend)
+app.put('/ramos/:id', authenticateToken, async (req, res) => {
+  try {
+    const { nombre, min_aprobacion, evaluaciones } = req.body
+    const result = await pool.query(
+      'UPDATE ramos SET nombre=$1, min_aprobacion=$2, evaluaciones=$3 WHERE id=$4 AND usuario_id=$5 RETURNING *',
+      [nombre, min_aprobacion, JSON.stringify(evaluaciones), req.params.id, req.user.id]
+    )
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Ramo no encontrado' })
+    res.json(result.rows[0])
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }) }
+})
+
 app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
   try {
     const { nota } = req.body
