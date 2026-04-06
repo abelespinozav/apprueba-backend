@@ -36,7 +36,11 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 app.set('trust proxy', 1)
 
 app.use(cors({
-  origin: process.env.CLIENT_URL,
+  origin: [
+    'http://localhost:5173',
+    'https://apprueba-production.up.railway.app',
+    process.env.CLIENT_URL
+  ].filter(Boolean),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -528,6 +532,20 @@ cron.schedule('0 12 * * *', async () => {
     console.error('❌ Error cron notificaciones:', err.message)
   }
 }, { timezone: 'America/Santiago' })
+
+
+// ── UNIVERSIDAD ──────────────────────────────────────────────────
+
+app.patch('/usuarios/universidad', authenticateToken, async (req, res) => {
+  try {
+    const { universidad } = req.body
+    const { rows } = await pool.query(
+      'UPDATE usuarios SET universidad = $1 WHERE id = $2 RETURNING *',
+      [universidad, req.user.id]
+    )
+    res.json(rows[0])
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
 
 app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
 })
