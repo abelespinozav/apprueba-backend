@@ -632,3 +632,4 @@ app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, 
     res.status(500).json({ error: 'Error al actualizar nota' })
   }
 })
+// Mon Apr  6 14:30:49 -04 2026
