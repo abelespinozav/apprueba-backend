@@ -67,6 +67,8 @@ async function initDB() {
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_eximicion DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS quiz_generado JSONB;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS guias_tareas JSONB;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
     CREATE TABLE IF NOT EXISTS evaluaciones (
       id SERIAL PRIMARY KEY,
@@ -685,3 +687,66 @@ app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, 
 })
 // Mon Apr  6 14:30:49 -04 2026
 // Mon Apr  6 14:31:43 -04 2026
+
+// ── QUIZ DE 20 PREGUNTAS ─────────────────────────────────────────
+app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
+  try {
+    const { forzar } = req.body
+    const { rows: evRows } = await pool.query(
+      `SELECT e.*, r.nombre as ramo_nombre,
+        (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
+         FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
+       FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
+       WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
+    const ev = evRows[0]
+    if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
+    if (!ev.archivos || ev.archivos.length === 0) return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
+    let textoArchivos = ''
+    for (const archivo of ev.archivos) {
+      if (archivo.datos) {
+        try {
+          const buffer = Buffer.from(archivo.datos, 'base64')
+          if (archivo.tipo && archivo.tipo.includes('pdf')) {
+            const parsed = await pdfParse(buffer)
+            textoArchivos += `\n\n--- ${archivo.nombre} ---\n${parsed.text.slice(0, 10000)}`
+          } else if (archivo.tipo && (archivo.tipo.includes('word') || archivo.tipo.includes('docx') || archivo.nombre?.endsWith('.docx'))) {
+            const result = await mammoth.extractRawText({ buffer })
+            textoArchivos += `\n\n--- ${archivo.nombre} ---\n${result.value.slice(0, 10000)}`
+          }
+        } catch(e) { console.error('Error extrayendo texto para quiz:', e.message) }
+      }
+    }
+    if (!textoArchivos.trim()) return res.status(400).json({ error: 'No se pudo extraer texto del material subido' })
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+    const prompt = `Eres un profesor universitario experto. Basándote EXCLUSIVAMENTE en el siguiente material de estudio, genera exactamente 20 preguntas de alternativas múltiples.
+
+Ramo: ${ev.ramo_nombre}
+Evaluación: ${ev.nombre}
+
+MATERIAL:
+${textoArchivos}
+
+INSTRUCCIONES:
+- EXACTAMENTE 20 preguntas con 4 alternativas (A, B, C, D)
+- Solo UNA correcta por pregunta
+- Varía dificultad: 8 fáciles, 8 medias, 4 difíciles
+- Responde SOLO JSON válido sin markdown
+
+Formato:
+{"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
+    const result = await model.generateContent(prompt)
+    const text = result.response.text()
+    const jsonMatch = text.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
+    const quizData = JSON.parse(jsonMatch[0])
+    if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
+    await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), req.params.id])
+    res.json({ preguntas: quizData.preguntas })
+  } catch (err) {
+    console.error('Error generando quiz:', err)
+    res.status(500).json({ error: 'Error al generar quiz: ' + err.message })
+  }
+})
