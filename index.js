@@ -361,7 +361,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       const jsonMatch = text.match(/\{[\s\S]*\}/)
       if (!jsonMatch) throw new Error('No JSON')
       const plan = JSON.parse(jsonMatch[0])
-      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan), req.params.id])
+      await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2 WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, req.params.id])
     // Guardar archivos en tabla archivos si no existen ya
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
@@ -713,7 +713,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
   try {
     const { forzar } = req.body
     const { rows: evRows } = await pool.query(
-      `SELECT e.*, r.nombre as ramo_nombre,
+      `SELECT e.*, e.texto_material, r.nombre as ramo_nombre,
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
          FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
        FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
@@ -723,9 +723,14 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
-    if (!ev.archivos || ev.archivos.length === 0) return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
-    let textoArchivos = ''
-    for (const archivo of ev.archivos) {
+    // Usar texto ya extraído si existe
+    if (ev.texto_material) {
+      textoArchivos = ev.texto_material
+    } else if (!ev.archivos || ev.archivos.length === 0) {
+      return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
+    }
+    let textoArchivos = ev.texto_material || ''
+    if (!textoArchivos) for (const archivo of ev.archivos) {
       if (archivo.datos) {
         try {
           const buffer = Buffer.from(archivo.datos, 'base64')
