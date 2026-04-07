@@ -67,6 +67,7 @@ async function initDB() {
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_eximicion DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
+    DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
     CREATE TABLE IF NOT EXISTS evaluaciones (
       id SERIAL PRIMARY KEY,
       ramo_id INTEGER REFERENCES ramos(id) ON DELETE CASCADE,
@@ -654,9 +655,10 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
           [e.nota || null, e.fecha || null, e.nombre, e.ponderacion, e.id, req.params.id]
         )
       } else if (!e.id || !realIds.has(e.id)) {
+        if (!e.nombre || !e.nombre.trim()) continue
         await pool.query(
           'INSERT INTO evaluaciones (ramo_id, nombre, ponderacion, nota, fecha) VALUES ($1, $2, $3, $4, $5)',
-          [req.params.id, e.nombre, e.ponderacion, e.nota || null, e.fecha || null]
+          [req.params.id, e.nombre.trim(), e.ponderacion, e.nota || null, e.fecha || null]
         )
       }
     }
