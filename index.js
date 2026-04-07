@@ -10,7 +10,8 @@ const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const webpush = require('web-push')
 const cron = require('node-cron')
-const pdfParse = require('pdf-parse')
+const pdfParseLib = require('pdf-parse')
+const pdfParse = pdfParseLib.default || pdfParseLib
 const mammoth = require('mammoth')
 const bcrypt = require('bcrypt')
 
