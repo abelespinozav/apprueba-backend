@@ -352,6 +352,16 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       if (!jsonMatch) throw new Error('No JSON')
       const plan = JSON.parse(jsonMatch[0])
       await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan), req.params.id])
+    // Guardar archivos en tabla archivos si no existen ya
+    if (ev.archivos && ev.archivos.length > 0) {
+      for (const archivo of ev.archivos) {
+        const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [req.params.id, archivo.nombre])
+        if (existe.length === 0) {
+          const buffer = Buffer.from(archivo.datos, 'base64')
+          await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [req.params.id, archivo.nombre, archivo.tipo, buffer])
+        }
+      }
+    }
       return res.json(plan)
     } catch(geminiErr) {
       console.error('Gemini error:', geminiErr.message)
