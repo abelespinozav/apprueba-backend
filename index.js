@@ -281,8 +281,17 @@ app.delete('/archivos/:id', authenticateToken, async (req, res) => {
 })
 
 // Generar plan de estudio con IA
-app.post('/evaluaciones/:id/plan-estudio', authenticateToken, async (req, res) => {
+app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('archivo', 10), async (req, res) => {
   try {
+    // Guardar archivos nuevos en BD antes de generar plan
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [req.params.id, file.originalname])
+        if (existe.length === 0) {
+          await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [req.params.id, file.originalname, file.mimetype, file.buffer])
+        }
+      }
+    }
     const { rows: evRows } = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre,
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
