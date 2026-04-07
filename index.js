@@ -778,10 +778,18 @@ INSTRUCCIONES:
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
     const result = await model.generateContent(prompt)
-    const text = result.response.text()
+    let text = result.response.text()
+    // Limpiar markdown si viene envuelto en ```json ... ```
+    text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
     const jsonMatch = text.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
-    const quizData = JSON.parse(jsonMatch[0])
+    let quizData
+    try {
+      quizData = JSON.parse(jsonMatch[0])
+    } catch (parseErr) {
+      console.error('JSON inválido:', jsonMatch[0].substring(0, 200))
+      throw new Error('La IA devolvió JSON inválido')
+    }
     if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
     await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), req.params.id])
     res.json({ preguntas: quizData.preguntas })
