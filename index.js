@@ -724,9 +724,8 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
     // Usar texto ya extraído si existe
-    if (ev.texto_material) {
-      textoArchivos = ev.texto_material
-    } else if (!ev.archivos || ev.archivos.length === 0) {
+    let textoArchivos = ev.texto_material || ''
+    if (!textoArchivos && (!ev.archivos || ev.archivos.length === 0)) {
       return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
     }
     let textoArchivos = ev.texto_material || ''
