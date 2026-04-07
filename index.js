@@ -757,6 +757,7 @@ INSTRUCCIONES:
 - Solo UNA correcta por pregunta
 - Varía dificultad: 8 fáciles, 8 medias, 4 difíciles
 - Responde SOLO JSON válido sin markdown
+- SIEMPRE escribe las preguntas, alternativas y explicaciones en ESPAÑOL, sin importar el idioma del material
 
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
