@@ -645,11 +645,20 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
       [nombre, min_aprobacion, nota_examen||null, nota_final||null, estado_final||null, ponderacion_examen||25, nota_eximicion||null, condiciones_eximicion||null, sin_rojos||false, req.params.id, req.user.id]
     )
     if (ramoResult.rows.length === 0) return res.status(404).json({ error: 'Ramo no encontrado' })
+    const evIds = await pool.query('SELECT id FROM evaluaciones WHERE ramo_id=$1', [req.params.id])
+    const realIds = new Set(evIds.rows.map(r => r.id))
     for (const e of evaluaciones) {
-      await pool.query(
-        'UPDATE evaluaciones SET nota=$1, fecha=$2 WHERE id=$3 AND ramo_id=$4',
-        [e.nota || null, e.fecha || null, e.id, req.params.id]
-      )
+      if (e.id && realIds.has(e.id)) {
+        await pool.query(
+          'UPDATE evaluaciones SET nota=$1, fecha=$2, nombre=$3, ponderacion=$4 WHERE id=$5 AND ramo_id=$6',
+          [e.nota || null, e.fecha || null, e.nombre, e.ponderacion, e.id, req.params.id]
+        )
+      } else if (!e.id || !realIds.has(e.id)) {
+        await pool.query(
+          'INSERT INTO evaluaciones (ramo_id, nombre, ponderacion, nota, fecha) VALUES ($1, $2, $3, $4, $5)',
+          [req.params.id, e.nombre, e.ponderacion, e.nota || null, e.fecha || null]
+        )
+      }
     }
     const updated = await pool.query(
       `SELECT r.*, json_agg(json_build_object('id',e.id,'nombre',e.nombre,'ponderacion',e.ponderacion,'nota',e.nota,'fecha',e.fecha) ORDER BY e.id) as evaluaciones FROM ramos r LEFT JOIN evaluaciones e ON e.ramo_id = r.id WHERE r.id=$1 GROUP BY r.id`,
