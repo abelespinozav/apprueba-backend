@@ -1,5 +1,6 @@
 require('dotenv').config()
 const express = require('express')
+const XLSX = require('xlsx')
 const cors = require('cors')
 const cookieParser = require('cookie-parser')
 const passport = require('passport')
@@ -321,25 +322,40 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
 
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
+    // Cargar horario del usuario
+    const horarioRes = await pool.query(
+      'SELECT dia, hora_inicio, hora_fin, ramo_nombre FROM horario WHERE usuario_id = $1 ORDER BY dia, hora_inicio',
+      [req.user.id]
+    )
+    const bloquesPorDia = {}
+    for (const b of horarioRes.rows) {
+      if (!bloquesPorDia[b.dia]) bloquesPorDia[b.dia] = []
+      bloquesPorDia[b.dia].push(`${b.hora_inicio}-${b.hora_fin} ${b.ramo_nombre}`)
+    }
+    const horarioTexto = Object.keys(bloquesPorDia).length > 0
+      ? Object.entries(bloquesPorDia).map(([dia, bloques]) => `${dia}: ${bloques.join(', ')}`).join('\n')
+      : null
+
     const promptText = `Eres un tutor universitario experto. Crea un plan de estudio detallado para un estudiante universitario chileno.
 
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre} (${ev.ponderacion}% del ramo)
 ${ev.fecha ? `Fecha de evaluación: ${ev.fecha}` : ''}
+${horarioTexto ? `\nHORARIO SEMANAL DEL ESTUDIANTE (bloques ocupados con clases):\n${horarioTexto}\n\nINSTRUCCIÓN OBLIGATORIA: Debes asignar cada tarea a un bloque de tiempo LIBRE (no ocupado por clases). En el campo "fecha" de cada tarea escribe el día y hora sugerida en formato "Lunes 15:00-16:30". Distribuye las tareas a lo largo de la semana en los huecos libres entre clases.` : ''}
 ${ev.archivos && ev.archivos.length > 0 ? `El estudiante ha subido material de estudio. Analiza su contenido y basa el plan en ese material.` : ''}
 
 Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin bloques de código):
 {
   "resumen": "descripción breve del plan en 1-2 oraciones",
   "tareas": [
-    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "alta", "duracion": 45, "fecha": "" },
-    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "media", "duracion": 30, "fecha": "" }
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "alta", "duracion": 45, "fecha": "Lunes 10:00-11:30" },
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "media", "duracion": 30, "fecha": "Martes 14:00-14:30" }
   ]
 }
 
-Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha puede ser string vacío.`
+Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha DEBE ser el día y hora sugerida para estudiar esa tarea, en formato "Lunes 10:00-11:30", usando SOLO los bloques libres del horario.`
 
-    // Extraer texto de los archivos
+    // Extraer texto de los archivos`
     let textoArchivos = ''
     console.log('📎 Archivos encontrados:', ev.archivos ? ev.archivos.length : 0)
     if (ev.archivos && ev.archivos.length > 0) {
@@ -475,6 +491,19 @@ app.post('/horario', authenticateToken, async (req, res) => {
        DO UPDATE SET hora_inicio=$3, hora_fin=$4, ramo_nombre=$5, codigo=$6, sala=$7, tipo=$8`,
       [req.user.id, dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo || 'clase']
     )
+    // Auto-crear ramo si no existe
+    if (ramo_nombre && ramo_nombre.trim()) {
+      const existe = await pool.query(
+        'SELECT id FROM ramos WHERE usuario_id = $1 AND LOWER(nombre) = LOWER($2)',
+        [req.user.id, ramo_nombre.trim()]
+      )
+      if (existe.rows.length === 0) {
+        await pool.query(
+          'INSERT INTO ramos (usuario_id, nombre, min_aprobacion) VALUES ($1, $2, $3)',
+          [req.user.id, ramo_nombre.trim(), 4.0]
+        )
+      }
+    }
     res.json({ ok: true })
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
@@ -497,41 +526,201 @@ app.post('/horario/limpiar', authenticateToken, async (req, res) => {
 })
 
 // Extraer horario desde imagen con GPT-4o Vision
+app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se subio archivo' })
+    
+    // Detectar si es XLSX nativo o XLS-HTML
+    const buf = req.file.buffer
+    const isXlsx = req.file.originalname.endsWith('.xlsx') || buf[0] === 0x50 && buf[1] === 0x4B
+    
+    if (isXlsx) {
+      // Parsear con librería xlsx
+      const workbook = XLSX.read(buf, { type: 'buffer' })
+      const sheet = workbook.Sheets[workbook.SheetNames[0]]
+      const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+      
+      const dias = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado']
+      const bloques = []
+      
+      // Buscar fila de encabezado con días
+      let diaColumns = {}
+      let headerRow = -1
+      for (let r = 0; r < data.length; r++) {
+        const row = data[r]
+        const found = dias.filter(d => row.some(c => String(c).toLowerCase().includes(d.toLowerCase().substring(0,3))))
+        if (found.length >= 3) {
+          headerRow = r
+          row.forEach((cell, ci) => {
+            const cellStr = String(cell).toLowerCase()
+            dias.forEach(d => {
+              if (cellStr.includes(d.toLowerCase().substring(0,3))) diaColumns[ci] = d
+            })
+          })
+          break
+        }
+      }
+      
+      if (headerRow === -1) return res.status(400).json({ error: 'No se encontro fila de dias en el Excel' })
+      
+      for (let r = headerRow + 1; r < data.length; r++) {
+        const row = data[r]
+        const periodoCell = String(row[0] || '')
+        const horaMatch = periodoCell.match(/(d{1,2}:d{2})/)
+        if (!horaMatch) continue
+        
+        // Buscar hora inicio y fin
+        let hora_inicio = '', hora_fin = ''
+        for (let c = 0; c < row.length; c++) {
+          const val = String(row[c] || '')
+          const horas = val.match(/(d{1,2}:d{2})/g)
+          if (horas && horas.length >= 2) { hora_inicio = horas[0]; hora_fin = horas[1]; break }
+          if (horas && horas.length === 1 && !hora_inicio) hora_inicio = horas[0]
+        }
+        if (!hora_inicio) continue
+        
+        Object.entries(diaColumns).forEach(([ci, dia]) => {
+          const cell = String(row[ci] || '').trim()
+          if (!cell) return
+          const partes = cell.split('\n').map(p => p.trim()).filter(p => p)
+          if (partes.length < 2) return
+          bloques.push({ dia, hora_inicio, hora_fin, ramo_nombre: partes[1] || partes[0], codigo: partes[0], sala: partes[2] || '', tipo: 'clase' })
+        })
+      }
+      
+      if (bloques.length === 0) return res.status(400).json({ error: 'No se pudieron extraer bloques del archivo xlsx' })
+      return res.json({ bloques })
+    }
+    
+    const html = req.file.buffer.toString('latin1')
+
+    const dias = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado']
+    const bloques = []
+    const rows = html.match(/<tr[\s\S]*?<\/tr>/gi) || []
+
+    for (const row of rows) {
+      const allCells = row.match(/<td[\s\S]*?<\/td>/gi) || []
+      if (allCells.length !== 7) continue
+
+      // Celda 0: período con hora
+      const periodoText = allCells[0].replace(/<br\s*\/?>/gi, '|').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim()
+      const partesPeriodo = periodoText.split('|').map(p => p.trim()).filter(p => p)
+      if (partesPeriodo.length < 3) continue
+      const hora_inicio = partesPeriodo[1]
+      const hora_fin = partesPeriodo[2]
+      if (!hora_inicio || !hora_fin) continue
+
+      // Celdas 1-6: días Lunes a Sábado
+      for (let i = 1; i <= 6; i++) {
+        const cell = allCells[i]
+        const texto = cell.replace(/<br\s*\/?>/gi, '|').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim()
+        const partes = texto.split('|').map(p => p.trim()).filter(p => p)
+        if (partes.length < 2) continue
+
+        let tipo = 'clase'
+        const bgMatch = cell.match(/background-colors*:s*([#w]+)/i) || cell.match(/bgcolor=["']?([#w]+)/i)
+        if (bgMatch) {
+          const color = bgMatch[1].toLowerCase().replace('#','')
+          if (['ffd700','ffa500','ffb300','f90'].some(c => color.includes(c))) tipo = 'topon'
+          else if (['90ee90','adff2f'].some(c => color.includes(c))) tipo = 'ayudantia'
+        }
+
+        bloques.push({
+          dia: dias[i - 1],
+          hora_inicio,
+          hora_fin,
+          ramo_nombre: partes[1],
+          codigo: partes[0],
+          sala: partes[2] || '',
+          tipo
+        })
+      }
+    }
+
+    if (bloques.length === 0) return res.status(400).json({ error: 'No se pudieron extraer bloques del archivo' })
+    console.log('Bloques extraidos:', bloques.length, bloques)
+    res.json({ bloques })
+  } catch(err) {
+    console.error('Error XLS:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se subió imagen' })
     const base64 = req.file.buffer.toString('base64')
     const mime = req.file.mimetype
 
-    const response = await openai.chat.completions.create({
+    // PASO 1: Transcribir la tabla en texto plano
+    const paso1 = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [{
         role: 'user',
         content: [
           {
             type: 'text',
-            text: `Analiza esta imagen de un horario universitario y extrae TODOS los bloques de clases.
-Para cada bloque devuelve un JSON array con objetos que tengan exactamente estas propiedades:
-- dia: string (Lunes, Martes, Miércoles, Jueves, Viernes, Sábado o Domingo)
-- hora_inicio: string en formato HH:MM (ej: "08:30")
-- hora_fin: string en formato HH:MM (ej: "09:30")
-- ramo_nombre: string con el nombre del ramo
-- codigo: string con el código del ramo si existe, sino ""
-- sala: string con la sala si existe, sino ""
-- tipo: string, uno de: "clase", "topon", "ayudantia", "prueba", "otra"
+            text: `Lee esta imagen de un horario universitario y transcribe EXACTAMENTE lo que ves en cada celda de la tabla.
+            
+Para cada celda NO vacía, escribe una línea con este formato exacto:
+PERIODO | DIA | CODIGO | NOMBRE_RAMO | SALA | COLOR
 
-Responde SOLO con el JSON array, sin markdown ni explicaciones.`
+Donde COLOR es: naranja=topon, verde=ayudantia, naranja_fuerte=prueba, blanco/azul=clase
+
+Ejemplo:
+1° | Martes | IME086-6 | ALGEBRA LINEAL | RA-2003 | clase
+5° | Lunes | ICF177-8 | FÍSICA II | R2-202 | topon
+
+No omitas ninguna celda. No inventes nada. Solo transcribe lo que ves.`
           },
-          {
-            type: 'image_url',
-            image_url: { url: `data:${mime};base64,${base64}` }
-          }
+          { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } }
         ]
       }],
       max_tokens: 2000
     })
 
-    const text = response.choices[0].message.content
+    const transcripcion = paso1.choices[0].message.content
+    console.log('📋 Transcripción:\n', transcripcion)
+
+    // PASO 2: Convertir transcripción a JSON
+    const periodos = {
+      '1°': { inicio: '08:30', fin: '09:30' },
+      '2°': { inicio: '09:40', fin: '10:40' },
+      '3°': { inicio: '10:50', fin: '11:50' },
+      '4°': { inicio: '12:00', fin: '13:00' },
+      'Alm.': { inicio: '13:10', fin: '14:10' },
+      '5°': { inicio: '14:30', fin: '15:30' },
+      '6°': { inicio: '15:40', fin: '16:40' },
+      '7°': { inicio: '16:50', fin: '17:50' },
+      '8°': { inicio: '18:00', fin: '19:00' },
+      '9°': { inicio: '19:10', fin: '20:10' },
+      '10°': { inicio: '20:20', fin: '21:20' }
+    }
+
+    const paso2 = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{
+        role: 'user',
+        content: `Convierte esta transcripción de horario universitario a un JSON array.
+
+Transcripción:
+${transcripcion}
+
+Tabla de períodos:
+${Object.entries(periodos).map(([p, h]) => `${p}: ${h.inicio}-${h.fin}`).join('\n')}
+
+Para cada línea de la transcripción, crea un objeto JSON:
+{ "dia": "Lunes", "hora_inicio": "08:30", "hora_fin": "09:30", "ramo_nombre": "ÁLGEBRA LINEAL", "codigo": "IME086-6", "sala": "RA-2003", "tipo": "clase" }
+
+Dias válidos: Lunes, Martes, Miércoles, Jueves, Viernes, Sábado
+tipo válidos: clase, topon, ayudantia, prueba, otra
+
+Responde SOLO con el JSON array, sin markdown.`
+      }],
+      max_tokens: 2000
+    })
+
+    const text = paso2.choices[0].message.content
     const jsonMatch = text.match(/\[[\s\S]*\]/)
     if (!jsonMatch) return res.status(400).json({ error: 'No se pudo extraer el horario' })
     const bloques = JSON.parse(jsonMatch[0])
