@@ -453,6 +453,92 @@ app.post('/auth/onboarding', authenticateToken, async (req, res) => {
 
 initDB().then(() => {
   
+
+// ── HORARIO ──────────────────────────────────────────────────────
+app.get('/horario', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM horario WHERE usuario_id = $1 ORDER BY dia, hora_inicio',
+      [req.user.id]
+    )
+    res.json(rows)
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/horario', authenticateToken, async (req, res) => {
+  try {
+    const { dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo } = req.body
+    await pool.query(
+      `INSERT INTO horario (usuario_id, dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (usuario_id, dia, periodo)
+       DO UPDATE SET hora_inicio=$3, hora_fin=$4, ramo_nombre=$5, codigo=$6, sala=$7, tipo=$8`,
+      [req.user.id, dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo || 'clase']
+    )
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+app.delete('/horario/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM horario WHERE id=$1 AND usuario_id=$2',
+      [req.params.id, req.user.id]
+    )
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/horario/limpiar', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM horario WHERE usuario_id=$1', [req.user.id])
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+// Extraer horario desde imagen con GPT-4o Vision
+app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se subió imagen' })
+    const base64 = req.file.buffer.toString('base64')
+    const mime = req.file.mimetype
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `Analiza esta imagen de un horario universitario y extrae TODOS los bloques de clases.
+Para cada bloque devuelve un JSON array con objetos que tengan exactamente estas propiedades:
+- dia: string (Lunes, Martes, Miércoles, Jueves, Viernes, Sábado o Domingo)
+- hora_inicio: string en formato HH:MM (ej: "08:30")
+- hora_fin: string en formato HH:MM (ej: "09:30")
+- ramo_nombre: string con el nombre del ramo
+- codigo: string con el código del ramo si existe, sino ""
+- sala: string con la sala si existe, sino ""
+- tipo: string, uno de: "clase", "topon", "ayudantia", "prueba", "otra"
+
+Responde SOLO con el JSON array, sin markdown ni explicaciones.`
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mime};base64,${base64}` }
+          }
+        ]
+      }],
+      max_tokens: 2000
+    })
+
+    const text = response.choices[0].message.content
+    const jsonMatch = text.match(/\[[\s\S]*\]/)
+    if (!jsonMatch) return res.status(400).json({ error: 'No se pudo extraer el horario' })
+    const bloques = JSON.parse(jsonMatch[0])
+    res.json({ bloques })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
 // Panel admin - solo abelespinozav@gmail.com
 app.get('/admin/stats', authenticateToken, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
