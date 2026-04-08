@@ -10,10 +10,10 @@ const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const webpush = require('web-push')
 const cron = require('node-cron')
-const pdfParseLib = require('pdf-parse')
-const pdfParse = pdfParseLib.default || pdfParseLib
+const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
 const bcrypt = require('bcrypt')
+const OpenAI = require('openai')
 
 const app = express()
 
@@ -25,6 +25,7 @@ webpush.setVapidDetails(
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
 app.set('trust proxy', 1)
@@ -69,6 +70,9 @@ async function initDB() {
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS quiz_generado JSONB;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_usados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_usados INTEGER DEFAULT 0;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS guias_tareas JSONB;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
     CREATE TABLE IF NOT EXISTS evaluaciones (
@@ -169,10 +173,10 @@ app.get('/auth/google/callback',
 )
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado FROM usuarios WHERE id = $1', [req.user.id])
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
-  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado } })
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -204,6 +208,7 @@ app.get('/ramos', authenticateToken, async (req, res) => {
         'fecha', e.fecha,
         'plan_estudio', e.plan_estudio,
         'tareas_completadas', e.tareas_completadas,
+        'guias_tareas', e.guias_tareas,
         'archivos', (
           SELECT json_agg(json_build_object('id', a.id, 'nombre', a.nombre, 'tipo', a.tipo))
           FROM archivos a WHERE a.evaluacion_id = e.id
@@ -237,7 +242,7 @@ app.post('/ramos', authenticateToken, async (req, res) => {
       json_build_object(
         'id', e.id, 'nombre', e.nombre, 'ponderacion', e.ponderacion,
         'nota', e.nota, 'fecha', e.fecha, 'plan_estudio', e.plan_estudio,
-        'tareas_completadas', e.tareas_completadas, 'archivos', '[]'::json
+        'tareas_completadas', e.tareas_completadas, 'archivos', COALESCE((SELECT json_agg(json_build_object('id', a.id, 'nombre', a.nombre, 'tipo', a.tipo)) FROM archivos a WHERE a.evaluacion_id = e.id), '[]'::json)
       ) ORDER BY e.id
     ) as evaluaciones
      FROM ramos r
@@ -261,6 +266,16 @@ app.delete('/ramos/:id', authenticateToken, async (req, res) => {
 })
 
 // Subir archivo
+app.get('/evaluaciones/:id/archivos', authenticateToken, async (req, res) => {
+  try {
+    const rows = await pool.query(
+      'SELECT a.id, a.nombre, a.tipo FROM archivos a JOIN evaluaciones e ON e.id = a.evaluacion_id JOIN ramos r ON r.id = e.ramo_id WHERE a.evaluacion_id = $1 AND r.usuario_id = $2',
+      [req.params.id, req.user.id]
+    )
+    res.json(rows.rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se recibió archivo' })
@@ -351,6 +366,22 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       }
     }
 
+    // Validar que el texto extraído sea real y no solo errores
+    // BLOQUEO: no generar plan sin material
+    if (!ev.archivos || ev.archivos.length === 0) {
+      return res.status(400).json({ error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el plan.' })
+    }
+    // BLOQUEO: límite de regeneraciones (solo si ya tiene plan)
+    if (ev.plan_estudio) {
+      const planesRes = await pool.query('SELECT planes_usados FROM usuarios WHERE id = $1', [req.user.id])
+      const planesUsados = planesRes.rows[0]?.planes_usados || 0
+      if (planesUsados >= 3) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados })
+    }
+    const textoLimpio = textoArchivos.replace(/--- Archivo:.*\(no se pudo extraer texto\) ---/g, '').replace(/--- Archivo:.*\(formato no soportado\) ---/g, '').trim()
+    if (textoArchivos && !textoLimpio) {
+      return res.status(400).json({ error: 'archivo_no_legible', mensaje: 'No pudimos leer tu archivo. Por favor sube un PDF o Word (.docx)' })
+    }
+
     const promptFinal = textoArchivos 
       ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- NUNCA rechaces el material ni sugieras buscar otro. Usa lo que hay.`
       : promptText
@@ -362,6 +393,9 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       if (!jsonMatch) throw new Error('No JSON')
       const plan = JSON.parse(jsonMatch[0])
       await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2 WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, req.params.id])
+      if (ev.plan_estudio) {
+        await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [req.user.id])
+      }
     // Guardar archivos en tabla archivos si no existen ya
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
@@ -424,7 +458,7 @@ app.get('/admin/stats', authenticateToken, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const usuarios = await pool.query(`
-      SELECT nombre, email, created_at, last_login
+      SELECT id, nombre, email, created_at, last_login, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados
       FROM usuarios
       ORDER BY created_at DESC
     `)
@@ -448,6 +482,74 @@ app.get('/admin/stats', authenticateToken, async (req, res) => {
   }
 })
 
+
+// Detalle completo de un usuario (solo admin)
+app.get('/admin/usuario/:id/detalle', authenticateToken, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const uid = req.params.id
+    const { rows: ramos } = await pool.query(`
+      SELECT r.id, r.nombre, r.min_aprobacion,
+        json_agg(
+          json_build_object(
+            'id', e.id,
+            'nombre', e.nombre,
+            'ponderacion', e.ponderacion,
+            'nota', e.nota,
+            'fecha', e.fecha,
+            'tiene_plan', e.plan_estudio IS NOT NULL,
+            'tiene_quiz', e.quiz_generado IS NOT NULL,
+            'archivos', COALESCE((
+              SELECT json_agg(json_build_object('nombre', a.nombre))
+              FROM archivos a WHERE a.evaluacion_id = e.id
+            ), '[]'::json)
+          ) ORDER BY e.fecha ASC
+        ) FILTER (WHERE e.id IS NOT NULL) as evaluaciones
+      FROM ramos r
+      LEFT JOIN evaluaciones e ON e.ramo_id = r.id
+      WHERE r.usuario_id = $1
+      GROUP BY r.id ORDER BY r.nombre
+    `, [uid])
+
+    const { rows: podcasts } = await pool.query(`
+      SELECT p.titulo, p.created_at, r.nombre as ramo_nombre
+      FROM podcasts p
+      JOIN evaluaciones e ON e.id = p.evaluacion_id
+      JOIN ramos r ON r.id = e.ramo_id
+      WHERE r.usuario_id = $1
+      ORDER BY p.created_at DESC LIMIT 10
+    `, [uid])
+
+    res.json({ ramos, podcasts })
+  } catch(err) { console.error('ERROR DETALLE:', err.message); res.status(500).json({ error: err.message }) }
+})
+
+// Eliminar usuario (solo admin)
+app.delete('/admin/usuario/:id', authenticateToken, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  if (parseInt(req.params.id) === req.user.id) return res.status(400).json({ error: 'No puedes eliminarte a ti mismo' })
+  try {
+    await pool.query('DELETE FROM usuarios WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+// Reset contadores de un usuario (solo admin)
+app.post('/admin/reset-contadores', authenticateToken, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { usuario_id, campo } = req.body
+    const camposValidos = ['podcasts_usados', 'ejercicios_usados', 'quizzes_usados', 'planes_usados']
+    if (campo === 'todos') {
+      await pool.query('UPDATE usuarios SET podcasts_usados=0, ejercicios_usados=0, quizzes_usados=0, planes_usados=0 WHERE id=$1', [usuario_id])
+    } else if (camposValidos.includes(campo)) {
+      await pool.query(`UPDATE usuarios SET ${campo}=0 WHERE id=$1`, [usuario_id])
+    } else {
+      return res.status(400).json({ error: 'Campo inválido' })
+    }
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
 
 // ── NOTIFICACIONES PUSH ──────────────────────────────────────────
 
@@ -584,6 +686,132 @@ app.patch('/usuarios/universidad', authenticateToken, async (req, res) => {
     )
     res.json(rows[0])
   } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+
+app.get('/evaluaciones/:id/podcast/audio', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id
+    const evId = req.params.id
+    const tareaIdx = req.query.tareaIdx ?? null
+    // Verificar que la evaluación pertenece al usuario
+    const evRes = await pool.query(
+      'SELECT e.id FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2',
+      [evId, userId]
+    )
+    if (!evRes.rows.length) return res.status(404).json({ error: 'No encontrada' })
+    const podRes = await pool.query(
+      'SELECT audio, titulo FROM podcasts WHERE evaluacion_id = $1 AND tarea_idx = $2',
+      [evId, tareaIdx]
+    )
+    if (!podRes.rows.length || !podRes.rows[0].audio) return res.status(404).json({ error: 'No hay podcast' })
+    const audioBuffer = Buffer.from(podRes.rows[0].audio, 'base64')
+    res.set({ 'Content-Type': 'audio/mpeg', 'X-Podcast-Titulo': encodeURIComponent(podRes.rows[0].titulo || '') })
+    res.send(audioBuffer)
+  } catch(err) {
+    res.status(500).json({ error: 'Error' })
+  }
+})
+
+app.get('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id
+    const evId = req.params.id
+    // Verificar que la evaluación pertenece al usuario
+    const evRes = await pool.query(
+      'SELECT e.id FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2',
+      [evId, userId]
+    )
+    if (!evRes.rows.length) return res.status(404).json({ error: 'No encontrada' })
+    // Devolver todos los podcasts de esta evaluación
+    const podRes = await pool.query(
+      'SELECT tarea_idx, titulo FROM podcasts WHERE evaluacion_id = $1',
+      [evId]
+    )
+    return res.json({ podcasts: podRes.rows })
+  } catch(err) {
+    res.status(500).json({ error: 'Error' })
+  }
+})
+
+app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id
+    const evId = req.params.id
+    const tareaIdx = req.body.tareaIdx ?? null
+    const userRes = await pool.query('SELECT podcasts_usados FROM usuarios WHERE id = $1', [userId])
+    const usados = userRes.rows[0]?.podcasts_usados || 0
+    if (usados >= 100) return res.status(403).json({ error: 'limite_alcanzado', usados })
+    const evRes = await pool.query(
+      `SELECT e.*, r.nombre as ramo_nombre, e.texto_material, e.plan_estudio FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2`,
+      [evId, userId]
+    )
+    if (!evRes.rows.length) return res.status(404).json({ error: 'No encontrada' })
+    const ev = evRes.rows[0]
+    // Leer archivos directamente si no hay texto_material
+    let material = ev.texto_material || ''
+    if (!material) {
+      const archivosRes = await pool.query('SELECT nombre, tipo, datos FROM archivos WHERE evaluacion_id = $1', [evId])
+      for (const archivo of archivosRes.rows) {
+        try {
+          const buf = Buffer.isBuffer(archivo.datos) ? archivo.datos : Buffer.from(archivo.datos)
+          if (archivo.tipo === 'application/pdf') {
+            const parsed = await pdfParse(buf)
+            material += parsed.text + ' '
+          } else if (archivo.tipo && archivo.tipo.includes('word')) {
+            const result = await mammoth.extractRawText({ buffer: buf })
+            material += result.value + ' '
+          }
+        } catch(e) { console.error('Error leyendo archivo:', e.message) }
+      }
+      material = material.trim()
+    }
+    // BLOQUEO: no generar podcast sin material
+    if (!material) {
+      return res.status(400).json({ error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el podcast.' })
+    }
+    const plan = ev.plan_estudio ? JSON.stringify(ev.plan_estudio) : ''
+    const guionRes = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{
+        role: 'system',
+        content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Ana" (profesora entusiasta y experta) y "Carlos" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 15 minutos. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "ana"|"carlos", "texto": "..." }] }. Mínimo 60 segmentos, máximo 80. Cada segmento debe tener al menos 3-4 oraciones completas y detalladas. Estructura: introducción motivadora (5 seg), desarrollo profundo por subtemas con ejemplos reales (45 seg), preguntas y respuestas entre Ana y Carlos (10 seg), conclusión y consejos para el examen (5 seg). Habla natural, usa analogías, ejemplos cotidianos y humor ocasional.'
+      }, {
+        role: 'user',
+        content: material
+        ? 'Crea un podcast educativo de EXACTAMENTE 15 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 12000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener mínimo 60 segmentos, cada uno con 3-4 oraciones. No resumas, desarrolla cada concepto en detalle como si fuera una clase completa.'
+        : 'Crea un podcast educativo de EXACTAMENTE 15 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Mínimo 60 segmentos, cada uno con 3-4 oraciones detalladas.'
+      }],
+      response_format: { type: 'json_object' }
+    })
+    let guion
+    try { guion = JSON.parse(guionRes.choices[0].message.content) }
+    catch(e) { return res.status(500).json({ error: 'Error generando guion' }) }
+    const voces = { ana: 'nova', carlos: 'echo' }
+    const audioBuffers = []
+    for (const seg of guion.segmentos) {
+      const audio = await openai.audio.speech.create({
+        model: 'tts-1',
+        voice: voces[seg.voz] || 'alloy',
+        input: seg.texto,
+        response_format: 'mp3'
+      })
+      audioBuffers.push(Buffer.from(await audio.arrayBuffer()))
+    }
+    const audioFinal = Buffer.concat(audioBuffers)
+    await pool.query('UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1', [userId])
+    const audioBase64 = audioFinal.toString('base64')
+    const tituloFinal = guion.titulo || ev.nombre
+    await pool.query(
+      'INSERT INTO podcasts (evaluacion_id, tarea_idx, titulo, audio) VALUES ($1, $2, $3, $4) ON CONFLICT (evaluacion_id, tarea_idx) DO UPDATE SET titulo = $3, audio = $4',
+      [evId, tareaIdx ?? 0, tituloFinal, audioBase64]
+    )
+    res.set({ 'Content-Type': 'audio/mpeg', 'X-Podcasts-Usados': usados + 1, 'X-Podcast-Titulo': encodeURIComponent(tituloFinal) })
+    res.send(audioFinal)
+  } catch(err) {
+    console.error('Error generando podcast:', err)
+    res.status(500).json({ error: 'Error generando podcast' })
+  }
 })
 
 app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
@@ -739,6 +967,10 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
+    // BLOQUEO: límite quizzes (solo nuevas generaciones, no cache)
+    const quizzesRes = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
+    const quizzesUsados = quizzesRes.rows[0]?.quizzes_usados || 0
+    if (quizzesUsados >= 5) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados })
     // Usar texto ya extraído si existe
     let textoArchivos = ev.texto_material || ''
     if (!textoArchivos && (!ev.archivos || ev.archivos.length === 0)) {
@@ -760,20 +992,28 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     }
     if (!textoArchivos.trim()) return res.status(400).json({ error: 'No se pudo extraer texto del material subido' })
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
-    const prompt = `Eres un profesor universitario experto. Basándote EXCLUSIVAMENTE en el siguiente material de estudio, genera exactamente 20 preguntas de alternativas múltiples.
+    const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
 
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
 
-MATERIAL:
+MATERIAL DE ESTUDIO:
 ${textoArchivos}
 
-INSTRUCCIONES:
-- EXACTAMENTE 20 preguntas con 4 alternativas (A, B, C, D)
-- Solo UNA correcta por pregunta
-- Varía dificultad: 8 fáciles, 8 medias, 4 difíciles
+INSTRUCCIONES CRÍTICAS:
+- Genera EXACTAMENTE 20 preguntas de alternativas múltiples (A, B, C, D)
+- PROHIBIDO preguntar sobre: autores, capítulos, estructura del libro, cuándo fue escrito, en qué página aparece algo, o cualquier cosa sobre el documento en sí
+- SOLO preguntas que evalúen COMPRENSIÓN REAL del contenido:
+  * Definiciones y conceptos ("¿Qué es...?", "¿Cuál es la diferencia entre X e Y?")
+  * Aplicación ("Si X ocurre, ¿qué sucede con Y?", "¿Cuál es el resultado de...?")
+  * Resolución de problemas (ejercicios numéricos, cálculos, demostraciones)
+  * Análisis ("¿Por qué...?", "¿Cuál de las siguientes afirmaciones es correcta sobre...?")
+  * Ejemplos concretos ("¿Cuál de estos es un ejemplo de...?")
+- Varía dificultad: 8 fáciles (recordar definición), 8 medias (aplicar concepto), 4 difíciles (analizar o resolver)
+- Las alternativas incorrectas deben ser plausibles (errores comunes, no absurdos)
+- La explicación debe enseñar POR QUÉ la respuesta es correcta, no solo decir cuál es
+- SIEMPRE en ESPAÑOL, sin importar el idioma del material
 - Responde SOLO JSON válido sin markdown
-- SIEMPRE escribe las preguntas, alternativas y explicaciones en ESPAÑOL, sin importar el idioma del material
 
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
@@ -792,9 +1032,219 @@ Formato:
     }
     if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
     await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), req.params.id])
+    await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [req.user.id])
     res.json({ preguntas: quizData.preguntas })
   } catch (err) {
     console.error('Error generando quiz:', err)
     res.status(500).json({ error: 'Error al generar quiz: ' + err.message })
+  }
+})
+
+// ── EJERCICIOS PDF ───────────────────────────────────────────────
+const PDFDocument = require('pdfkit')
+
+app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res) => {
+  try {
+    const { tarea, tareaIndex } = req.body
+    const evRes = await pool.query(
+      `SELECT e.*, r.nombre as ramo_nombre FROM evaluaciones e
+       JOIN ramos r ON e.ramo_id = r.id
+       WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (evRes.rows.length === 0) return res.status(404).json({ error: 'No encontrada' })
+    const ev = evRes.rows[0]
+
+    // BLOQUEO: límite ejercicios
+    const ejerciciosRes = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
+    const ejerciciosUsados = ejerciciosRes.rows[0]?.ejercicios_usados || 0
+    if (ejerciciosUsados >= 5) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados })
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: `Eres un profesor universitario experto en "${ev.ramo_nombre}".
+Genera exactamente 20 ejercicios sobre el tema: "${tarea.titulo}".
+Contexto: ${tarea.descripcion}
+
+- Ejercicios 1-7: FÁCILES (conceptos básicos)
+- Ejercicios 8-14: MEDIOS (aplicación)
+- Ejercicios 15-20: DIFÍCILES (análisis y síntesis)
+- Cada ejercicio debe tener enunciado claro y solución detallada paso a paso
+
+Responde SOLO con JSON válido:
+{"ejercicios":[{"numero":1,"dificultad":"fácil","enunciado":"...","solucion":"..."}]}` }],
+      response_format: { type: 'json_object' }
+    })
+
+    const data = JSON.parse(completion.choices[0].message.content)
+    const ejercicios = data.ejercicios || []
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
+    await pool.query('UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1', [req.user.id])
+    doc.pipe(res)
+
+    // ── Helpers ──────────────────────────────────────────────────
+    const BG       = '#0f0f1a'
+    const CARD     = '#1a1a2e'
+    const ACCENT   = '#6c63ff'
+    const ACCENT2  = '#a78bfa'
+    const WHITE    = '#ffffff'
+    const GRAY     = '#a0a0b8'
+    const EASY     = '#34d399'
+    const MED      = '#fbbf24'
+    const HARD     = '#f87171'
+    const W        = 595 - 100  // page width minus margins
+    const PAGE_H   = 842
+
+    const diffColor = (d) => {
+      const dl = (d || '').toLowerCase()
+      if (dl.includes('f')) return EASY
+      if (dl.includes('m')) return MED
+      return HARD
+    }
+    const diffLabel = (d) => {
+      const dl = (d || '').toLowerCase()
+      if (dl.includes('f')) return 'FÁCIL'
+      if (dl.includes('m')) return 'MEDIO'
+      return 'DIFÍCIL'
+    }
+
+    const drawPageBg = () => {
+      doc.rect(0, 0, 595, PAGE_H).fill(BG)
+    }
+
+    // ── PORTADA ──────────────────────────────────────────────────
+    drawPageBg()
+
+    // Header bar
+    doc.rect(0, 0, 595, 8).fill(ACCENT)
+
+    // Logo pill
+    doc.roundedRect(50, 40, 120, 32, 8).fill(ACCENT)
+    doc.fontSize(15).fillColor(WHITE).font('Helvetica-Bold').text('APPrueba', 50, 49, { width: 120, align: 'center' })
+
+    // Título principal
+    doc.fontSize(28).fillColor(WHITE).font('Helvetica-Bold').text('Guía de Ejercicios', 50, 110, { width: W })
+    doc.moveDown(0.4)
+    doc.fontSize(16).fillColor(ACCENT2).font('Helvetica').text(tarea.titulo, 50, doc.y, { width: W })
+    doc.moveDown(0.6)
+    doc.fontSize(12).fillColor(GRAY).text(ev.ramo_nombre + '  ·  ' + ev.nombre, 50, doc.y, { width: W })
+
+    // Divider
+    doc.moveDown(1.2)
+    doc.rect(50, doc.y, W, 2).fill(ACCENT)
+    doc.moveDown(1.5)
+
+    // Stats cards
+    const cardY = doc.y
+    const cardW = (W - 20) / 3
+    const stats = [
+      { label: 'Ejercicios', value: '20', color: ACCENT },
+      { label: 'Dificultades', value: '3 niveles', color: ACCENT2 },
+      { label: 'Respuestas', value: 'Al final', color: EASY }
+    ]
+    stats.forEach((s, i) => {
+      const cx = 50 + i * (cardW + 10)
+      doc.roundedRect(cx, cardY, cardW, 60, 8).fill(CARD)
+      doc.fontSize(20).fillColor(s.color).font('Helvetica-Bold').text(s.value, cx, cardY + 10, { width: cardW, align: 'center' })
+      doc.fontSize(9).fillColor(GRAY).font('Helvetica').text(s.label, cx, cardY + 36, { width: cardW, align: 'center' })
+    })
+
+    doc.moveDown(5)
+
+    // Leyenda dificultad
+    const legY = cardY + 80
+    doc.fontSize(10).fillColor(GRAY).font('Helvetica').text('Niveles de dificultad:', 50, legY)
+    const levels = [{ label: 'Fácil  (1–7)', color: EASY }, { label: 'Medio  (8–14)', color: MED }, { label: 'Difícil  (15–20)', color: HARD }]
+    levels.forEach((l, i) => {
+      const lx = 50 + i * 160
+      doc.circle(lx + 6, legY + 22, 5).fill(l.color)
+      doc.fontSize(10).fillColor(WHITE).text(l.label, lx + 16, legY + 16)
+    })
+
+    // Footer portada
+    doc.fontSize(9).fillColor(GRAY).text('Generado por APPrueba · apprueba.cl', 50, PAGE_H - 40, { width: W, align: 'center' })
+
+    // ── EJERCICIOS ───────────────────────────────────────────────
+    ejercicios.forEach((ej, idx) => {
+      doc.addPage()
+      drawPageBg()
+      doc.rect(0, 0, 595, 8).fill(diffColor(ej.dificultad))
+
+      const dc = diffColor(ej.dificultad)
+      const dl = diffLabel(ej.dificultad)
+
+      // Número grande de fondo
+      doc.fontSize(90).fillColor('#ffffff08').font('Helvetica-Bold').text(String(ej.numero), 400, 20, { width: 160, align: 'right' })
+
+      // Badge dificultad
+      doc.roundedRect(50, 20, 70, 22, 6).fill(dc)
+      doc.fontSize(9).fillColor(BG).font('Helvetica-Bold').text(dl, 50, 26, { width: 70, align: 'center' })
+
+      // Número ejercicio
+      doc.fontSize(13).fillColor(GRAY).font('Helvetica').text('Ejercicio', 130, 20)
+      doc.fontSize(22).fillColor(WHITE).font('Helvetica-Bold').text(String(ej.numero), 130, 34)
+
+      // Línea separadora
+      doc.rect(50, 58, W, 1).fill(ACCENT)
+
+      // Enunciado
+      doc.moveDown(0.5)
+      doc.fontSize(11).fillColor(ACCENT2).font('Helvetica-Bold').text('Enunciado', 50, 72)
+      doc.moveDown(0.3)
+      doc.fontSize(11).fillColor(WHITE).font('Helvetica').text(ej.enunciado, 50, doc.y, { width: W, lineGap: 4 })
+
+      // Espacio para respuesta del alumno
+      doc.moveDown(1.5)
+      doc.fontSize(10).fillColor(GRAY).font('Helvetica-Bold').text('Tu respuesta:', 50, doc.y)
+      doc.moveDown(0.4)
+      // Líneas para escribir
+      for (let l = 0; l < 5; l++) {
+        const ly = doc.y + l * 22
+        if (ly < PAGE_H - 60) {
+          doc.rect(50, ly, W, 1).fill('#2a2a4a')
+        }
+      }
+
+      // Footer
+      doc.fontSize(8).fillColor(GRAY).text(`${ev.ramo_nombre}  ·  APPrueba`, 50, PAGE_H - 30, { width: W, align: 'center' })
+    })
+
+    // ── HOJA DE RESPUESTAS ───────────────────────────────────────
+    doc.addPage()
+    drawPageBg()
+    doc.rect(0, 0, 595, 8).fill(ACCENT)
+
+    doc.fontSize(22).fillColor(WHITE).font('Helvetica-Bold').text('Respuestas', 50, 30, { width: W })
+    doc.fontSize(11).fillColor(GRAY).font('Helvetica').text('Revisa tus respuestas solo después de completar todos los ejercicios', 50, 58, { width: W })
+    doc.rect(50, 78, W, 2).fill(ACCENT)
+
+    let ry = 95
+    ejercicios.forEach((ej) => {
+      if (ry > PAGE_H - 120) {
+        doc.addPage()
+        drawPageBg()
+        doc.rect(0, 0, 595, 8).fill(ACCENT)
+        ry = 30
+      }
+      const dc = diffColor(ej.dificultad)
+      // Número + badge
+      doc.roundedRect(50, ry, 28, 18, 4).fill(dc)
+      doc.fontSize(9).fillColor(BG).font('Helvetica-Bold').text(String(ej.numero), 50, ry + 4, { width: 28, align: 'center' })
+      // Solución
+      doc.fontSize(10).fillColor(WHITE).font('Helvetica-Bold').text('Ejercicio ' + ej.numero, 88, ry, { continued: false })
+      doc.fontSize(10).fillColor(GRAY).font('Helvetica').text(ej.solucion, 88, ry + 14, { width: W - 38, lineGap: 3 })
+      const textH = doc.heightOfString(ej.solucion, { width: W - 38 })
+      ry += textH + 30
+      // Divider
+      doc.rect(88, ry - 10, W - 38, 1).fill('#2a2a4a')
+    })
+
+    doc.end()
+  } catch(e) {
+    console.error('Error ejercicios PDF:', e)
+    if (!res.headersSent) res.status(500).json({ error: 'Error generando ejercicios' })
   }
 })
