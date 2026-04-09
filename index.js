@@ -905,12 +905,12 @@ app.post('/notificaciones/config', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Máximo 3 recordatorios' })
     }
     const { rows } = await pool.query(
-      `INSERT INTO notificacion_config (usuario_id, dias_antes, activo)
-       VALUES ($1, $2, $3)
+      `INSERT INTO notificacion_config (usuario_id, dias_antes, activo, notif_clases, notif_ventanas)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (usuario_id) DO UPDATE
-       SET dias_antes = $2, activo = $3
+       SET dias_antes = $2, activo = $3, notif_clases = $4, notif_ventanas = $5
        RETURNING *`,
-      [req.user.id, dias_antes, activo]
+      [req.user.id, dias_antes, activo, req.body.notif_clases !== false, req.body.notif_ventanas !== false]
     )
     res.json(rows[0])
   } catch(err) { res.status(500).json({ error: err.message }) }
@@ -988,6 +988,145 @@ cron.schedule('0 12 * * *', async () => {
     console.error('❌ Error cron notificaciones:', err.message)
   }
 }, { timezone: 'America/Santiago' })
+
+// ── CRON — Clases próximas (cada 15 min) ─────────────────────────
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const ahora = new Date()
+    const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado']
+    const diaHoy = diasSemana[ahora.getDay()]
+    const horaAhora = ahora.toTimeString().slice(0,5)
+    
+    // Hora en 15 minutos
+    const en15 = new Date(ahora.getTime() + 15 * 60000)
+    const hora15 = en15.toTimeString().slice(0,5)
+
+    // Buscar clases que empiezan entre ahora y 15 min
+    const { rows } = await pool.query(`
+      SELECT h.usuario_id, h.ramo_nombre, h.hora_inicio, h.hora_fin, h.sala, h.tipo
+      FROM horario h
+      JOIN notificacion_config nc ON nc.usuario_id = h.usuario_id
+      WHERE nc.activo = true
+        AND nc.notif_clases = true
+        AND h.dia = $1
+        AND h.hora_inicio > $2
+        AND h.hora_inicio <= $3
+    `, [diaHoy, horaAhora, hora15])
+
+    for (const row of rows) {
+      const { rows: subs } = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+        [row.usuario_id]
+      )
+      const tipoEmoji = row.tipo === 'topon' ? '⚡' : row.tipo === 'ayudantia' ? '🙋' : '🏫'
+      const sala = row.sala ? ` · ${row.sala}` : ''
+      const mensaje = `${row.ramo_nombre} empieza a las ${row.hora_inicio}${sala}`
+
+      for (const sub of subs) {
+        try {
+          await webpush.sendNotification(sub.subscription, JSON.stringify({
+            title: `${tipoEmoji} Clase en 15 minutos`,
+            body: mensaje,
+            icon: '/icon-192.png'
+          }))
+        } catch(e) {
+          if (e.statusCode === 410) {
+            await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
+          }
+        }
+      }
+    }
+  } catch(err) {
+    console.error('❌ Error cron clases próximas:', err.message)
+  }
+}, { timezone: 'America/Santiago' })
+
+// ── CRON — Ventanas de estudio (8:00 AM Chile) ───────────────────
+cron.schedule('0 11 * * *', async () => {
+  try {
+    const ahora = new Date()
+    const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado']
+    const diaHoy = diasSemana[ahora.getDay()]
+
+    // Obtener usuarios con notificaciones activas
+    const { rows: usuarios } = await pool.query(`
+      SELECT DISTINCT nc.usuario_id
+      FROM notificacion_config nc
+      WHERE nc.activo = true
+        AND nc.notif_ventanas = true
+    `)
+
+    for (const u of usuarios) {
+      // Obtener horario de hoy
+      const { rows: clases } = await pool.query(`
+        SELECT hora_inicio, hora_fin FROM horario
+        WHERE usuario_id = $1 AND dia = $2
+        ORDER BY hora_inicio
+      `, [u.usuario_id, diaHoy])
+
+      // Detectar ventanas libres de 1h+ entre 8:00 y 22:00
+      const ventanas = []
+      const bloques = [{ hora_inicio: '08:00', hora_fin: '08:00' }, ...clases, { hora_inicio: '22:00', hora_fin: '22:00' }]
+      
+      for (let i = 0; i < bloques.length - 1; i++) {
+        const finAnterior = bloques[i].hora_fin
+        const inicioSiguiente = bloques[i+1].hora_inicio
+        const [fh, fm] = finAnterior.split(':').map(Number)
+        const [ih, im] = inicioSiguiente.split(':').map(Number)
+        const durMin = (ih * 60 + im) - (fh * 60 + fm)
+        if (durMin >= 60) {
+          ventanas.push({ desde: finAnterior, hasta: inicioSiguiente, durMin })
+        }
+      }
+
+      if (ventanas.length === 0) continue
+
+      // Obtener evaluación más próxima
+      const { rows: evals } = await pool.query(`
+        SELECT e.nombre, r.nombre as ramo_nombre, e.fecha
+        FROM evaluaciones e
+        JOIN ramos r ON r.id = e.ramo_id
+        WHERE r.usuario_id = $1
+          AND e.fecha >= CURRENT_DATE
+          AND e.nota IS NULL
+        ORDER BY e.fecha ASC
+        LIMIT 1
+      `, [u.usuario_id])
+
+      const mejorVentana = ventanas.sort((a,b) => b.durMin - a.durMin)[0]
+      const horas = Math.floor(mejorVentana.durMin / 60)
+      const mins = mejorVentana.durMin % 60
+      const durTexto = mins > 0 ? `${horas}h ${mins}min` : `${horas}h`
+
+      let body = `Tienes ${durTexto} libres de ${mejorVentana.desde} a ${mejorVentana.hasta}`
+      if (evals.length > 0) {
+        body += ` · Aprovecha para estudiar ${evals[0].ramo_nombre}`
+      }
+
+      const { rows: subs } = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+        [u.usuario_id]
+      )
+
+      for (const sub of subs) {
+        try {
+          await webpush.sendNotification(sub.subscription, JSON.stringify({
+            title: '📖 Ventana de estudio disponible',
+            body,
+            icon: '/icon-192.png'
+          }))
+        } catch(e) {
+          if (e.statusCode === 410) {
+            await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
+          }
+        }
+      }
+    }
+  } catch(err) {
+    console.error('❌ Error cron ventanas estudio:', err.message)
+  }
+}, { timezone: 'America/Santiago' })
+
 
 
 // ── UNIVERSIDAD ──────────────────────────────────────────────────
@@ -1588,5 +1727,33 @@ Responde SOLO con JSON válido:
   } catch(e) {
     console.error('Error ejercicios PDF:', e)
     if (!res.headersSent) res.status(500).json({ error: 'Error generando ejercicios' })
+  }
+})
+
+// ── ENDPOINT TEMPORAL DE PRUEBA ──────────────────────────────────
+app.post('/notificaciones/test', authenticateToken, async (req, res) => {
+  try {
+    const { rows: subs } = await pool.query(
+      'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+      [req.user.id]
+    )
+    if (subs.length === 0) return res.json({ ok: false, msg: 'No tienes subscripción push registrada' })
+    
+    const tipo = req.body.tipo || 'clase'
+    let payload
+    if (tipo === 'clase') {
+      payload = { title: '🏫 Clase en 15 minutos', body: 'Álgebra Lineal empieza a las 14:30 · Sala B-101', icon: '/icon-192.png' }
+    } else {
+      payload = { title: '📖 Ventana de estudio disponible', body: 'Tienes 2h libres de 10:00 a 12:00 · Aprovecha para estudiar Física II', icon: '/icon-192.png' }
+    }
+
+    let enviadas = 0
+    for (const sub of subs) {
+      await webpush.sendNotification(sub.subscription, JSON.stringify(payload))
+      enviadas++
+    }
+    res.json({ ok: true, enviadas, payload })
+  } catch(err) {
+    res.status(500).json({ ok: false, error: err.message })
   }
 })
