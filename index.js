@@ -1750,7 +1750,7 @@ app.post('/notificaciones/test', authenticateToken, async (req, res) => {
     let enviadas = 0
     console.log("SUB DEBUG:", typeof subs[0].subscription, JSON.stringify(subs[0].subscription).slice(0,100))
     for (const sub of subs) {
-      await webpush.sendNotification(sub.subscription, JSON.stringify(payload))
+      await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify(payload))
       enviadas++
     }
     res.json({ ok: true, enviadas, payload })
