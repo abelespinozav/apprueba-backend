@@ -917,6 +917,31 @@ app.post('/notificaciones/config', authenticateToken, async (req, res) => {
 })
 
 // Endpoint para obtener la VAPID public key
+
+// Broadcast notificación a todos los usuarios (solo admin)
+app.post('/admin/notificacion-broadcast', authenticateToken, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { titulo, mensaje, url } = req.body
+    const { rows: subs } = await pool.query('SELECT subscription FROM push_subscriptions')
+    const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
+    let enviadas = 0, fallidas = 0
+    for (const row of subs) {
+      try {
+        const s = row.subscription
+        await webpush.sendNotification(
+          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
+          payload
+        )
+        enviadas++
+      } catch(e) { fallidas++ }
+    }
+    res.json({ ok: true, enviadas, fallidas, total: subs.length })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.get('/notificaciones/vapid-key', (req, res) => {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY })
 })
