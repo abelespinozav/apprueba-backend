@@ -391,7 +391,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
     if (ev.plan_estudio) {
       const planesRes = await pool.query('SELECT planes_usados FROM usuarios WHERE id = $1', [req.user.id])
       const planesUsados = planesRes.rows[0]?.planes_usados || 0
-      if (planesUsados >= 3) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados })
+      if (planesUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados })
     }
     const textoLimpio = textoArchivos.replace(/--- Archivo:.*\(no se pudo extraer texto\) ---/g, '').replace(/--- Archivo:.*\(formato no soportado\) ---/g, '').trim()
     if (textoArchivos && !textoLimpio) {
@@ -1259,7 +1259,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     // BLOQUEO: límite quizzes (solo nuevas generaciones, no cache)
     const quizzesRes = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
     const quizzesUsados = quizzesRes.rows[0]?.quizzes_usados || 0
-    if (quizzesUsados >= 5) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados })
+    if (quizzesUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados })
     // Usar texto ya extraído si existe
     let textoArchivos = ev.texto_material || ''
     if (!textoArchivos && (!ev.archivos || ev.archivos.length === 0)) {
@@ -1347,7 +1347,7 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
     // BLOQUEO: límite ejercicios
     const ejerciciosRes = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
     const ejerciciosUsados = ejerciciosRes.rows[0]?.ejercicios_usados || 0
-    if (ejerciciosUsados >= 5) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados })
+    if (ejerciciosUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados })
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
