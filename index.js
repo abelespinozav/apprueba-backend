@@ -343,7 +343,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
 
     // Cargar horario del usuario
     const horarioRes = await pool.query(
