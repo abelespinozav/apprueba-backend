@@ -105,6 +105,18 @@ passport.use(new GoogleStrategy({
   callbackURL: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
 }, async (accessToken, refreshToken, profile, done) => {
   try {
+    // Verificar si ya existe
+    const { rows: existing } = await pool.query('SELECT id FROM usuarios WHERE google_id = $1', [profile.id])
+    const esNuevo = existing.length === 0
+
+    // Si es nuevo, verificar si hay cupo
+    if (esNuevo) {
+      const { rows: countRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios')
+      if (parseInt(countRows[0].total) >= 50) {
+        return done(null, false, { message: 'lista_espera' })
+      }
+    }
+
     const { rows } = await pool.query(
       `INSERT INTO usuarios (google_id, nombre, email, avatar, last_login)
        VALUES ($1, $2, $3, $4, NOW())
@@ -113,7 +125,18 @@ passport.use(new GoogleStrategy({
        RETURNING *`,
       [profile.id, profile.displayName, profile.emails[0].value, profile.photos[0].value]
     )
-    return done(null, rows[0])
+    const usuario = rows[0]
+
+    // Si es nuevo, marcar como fundador
+    if (esNuevo) {
+      const { rows: countRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
+      if (parseInt(countRows[0].total) < 50) {
+        await pool.query('UPDATE usuarios SET es_fundador = TRUE WHERE id = $1', [usuario.id])
+        usuario.es_fundador = true
+      }
+    }
+
+    return done(null, usuario)
   } catch (err) {
     return done(err)
   }
@@ -162,7 +185,7 @@ app.post('/auth/login', async (req, res) => {
 app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false, prompt: 'select_account' }))
 
 app.get('/auth/google/callback',
-  passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}?error=true` }),
+  passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}?error=lista_espera` }),
   (req, res) => {
     const token = jwt.sign(
       { id: req.user.id, email: req.user.email },
@@ -174,10 +197,10 @@ app.get('/auth/google/callback',
 )
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados FROM usuarios WHERE id = $1', [req.user.id])
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
-  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2 }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2, es_fundador: u.es_fundador, numero_registro: u.numero_registro }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -937,6 +960,18 @@ app.post('/admin/notificacion-broadcast', authenticateToken, async (req, res) =>
       } catch(e) { fallidas++ }
     }
     res.json({ ok: true, enviadas, fallidas, total: subs.length })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+
+// Cuántos spots de fundador quedan
+app.get('/fundadores/spots', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
+    const usados = parseInt(rows[0].total)
+    res.json({ usados, total: 50, quedan: Math.max(0, 50 - usados), lleno: usados >= 50 })
   } catch(e) {
     res.status(500).json({ error: e.message })
   }
