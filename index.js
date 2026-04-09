@@ -343,8 +343,6 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
-
     // Cargar horario del usuario
     const horarioRes = await pool.query(
       'SELECT dia, hora_inicio, hora_fin, ramo_nombre FROM horario WHERE usuario_id = $1 ORDER BY dia, hora_inicio',
@@ -428,8 +426,12 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       : promptText
 
     try {
-      const result = await model.generateContent([{ text: promptFinal }])
-      const text = result.response.text()
+      const result = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: promptFinal }],
+        temperature: 0.7
+      })
+      const text = result.choices[0].message.content
       const jsonMatch = text.match(/\{[\s\S]*\}/)
       if (!jsonMatch) throw new Error('No JSON')
       const plan = JSON.parse(jsonMatch[0])
@@ -449,10 +451,14 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       }
       return res.json(plan)
     } catch(geminiErr) {
-      console.error('Gemini error:', geminiErr.message)
-      // Fallback: reintentar con texto plano
-      const fallback = await model.generateContent([{ text: promptFinal }])
-      const text2 = fallback.response.text()
+      console.error('GPT error:', geminiErr.message)
+      // Fallback: reintentar
+      const fallback = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: promptFinal }],
+        temperature: 0.7
+      })
+      const text2 = fallback.choices[0].message.content
       const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
       if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
       const plan2 = JSON.parse(jsonMatch2[0])
@@ -1388,7 +1394,6 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
       return res.json({ ...guiasGuardadas[key], cached: true })
     }
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
     let contenidoArchivos = ''
     if (ev.archivos && ev.archivos.length > 0) {
       contenidoArchivos = `\nEl estudiante ha subido los siguientes archivos de estudio: ${ev.archivos.map(a => a.nombre).join(', ')}. Usa estos temas como contexto.`
@@ -1420,8 +1425,12 @@ Responde SOLO con un JSON válido (sin markdown, sin bloques de código):
 
 Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
 
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7
+    })
+    const text = result.choices[0].message.content
     const jsonMatch = text.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
     const guia = JSON.parse(jsonMatch[0])
@@ -1527,7 +1536,6 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
       }
     }
     if (!textoArchivos.trim()) return res.status(400).json({ error: 'No se pudo extraer texto del material subido' })
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
     const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
 
 Ramo: ${ev.ramo_nombre}
@@ -1553,8 +1561,12 @@ INSTRUCCIONES CRÍTICAS:
 
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
-    const result = await model.generateContent(prompt)
-    let text = result.response.text()
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7
+    })
+    let text = result.choices[0].message.content
     // Limpiar markdown si viene envuelto en ```json ... ```
     text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
     const jsonMatch = text.match(/\{[\s\S]*\}/)
