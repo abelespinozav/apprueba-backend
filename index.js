@@ -159,7 +159,7 @@ app.post('/auth/login', async (req, res) => {
   }
 })
 
-app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false }))
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'], session: false, prompt: 'select_account' }))
 
 app.get('/auth/google/callback',
   passport.authenticate('google', { session: false, failureRedirect: `${process.env.CLIENT_URL}?error=true` }),
