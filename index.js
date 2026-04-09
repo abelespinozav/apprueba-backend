@@ -966,8 +966,7 @@ cron.schedule('0 12 * * *', async () => {
 
         for (const sub of subs) {
           try {
-            await webpush.sendNotification(
-              sub.subscription,
+            await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}},
               JSON.stringify({
                 title: '📚 APPrueba',
                 body: mensaje,
@@ -1024,7 +1023,7 @@ cron.schedule('*/15 * * * *', async () => {
 
       for (const sub of subs) {
         try {
-          await webpush.sendNotification(sub.subscription, JSON.stringify({
+          await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify({
             title: `${tipoEmoji} Clase en 15 minutos`,
             body: mensaje,
             icon: '/icon-192.png'
@@ -1110,7 +1109,7 @@ cron.schedule('0 11 * * *', async () => {
 
       for (const sub of subs) {
         try {
-          await webpush.sendNotification(sub.subscription, JSON.stringify({
+          await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify({
             title: '📖 Ventana de estudio disponible',
             body,
             icon: '/icon-192.png'
