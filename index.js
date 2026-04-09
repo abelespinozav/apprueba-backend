@@ -1749,7 +1749,7 @@ app.post('/notificaciones/test', authenticateToken, async (req, res) => {
 
     let enviadas = 0
     for (const sub of subs) {
-      await webpush.sendNotification(sub.subscription, JSON.stringify(payload))
+      await webpush.sendNotification(JSON.stringify(sub.subscription), JSON.stringify(payload))
       enviadas++
     }
     res.json({ ok: true, enviadas, payload })
