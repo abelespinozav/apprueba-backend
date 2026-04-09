@@ -518,6 +518,20 @@ app.delete('/horario/:id', authenticateToken, async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
 
+
+app.post('/horario/sincronizar-ramos', authenticateToken, async (req, res) => {
+  try {
+    const bloques = await pool.query('SELECT DISTINCT ramo_nombre FROM horario WHERE usuario_id=$1', [req.user.id])
+    for (const row of bloques.rows) {
+      const existe = await pool.query('SELECT id FROM ramos WHERE usuario_id=$1 AND nombre=$2', [req.user.id, row.ramo_nombre])
+      if (existe.rows.length === 0) {
+        await pool.query('INSERT INTO ramos (usuario_id, nombre, min_aprobacion) VALUES ($1, $2, $3)', [req.user.id, row.ramo_nombre.trim(), 4.0])
+      }
+    }
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
 app.post('/horario/limpiar', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM horario WHERE usuario_id=$1', [req.user.id])
