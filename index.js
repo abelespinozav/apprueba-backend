@@ -320,7 +320,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
 
     // Cargar horario del usuario
     const horarioRes = await pool.query(
@@ -391,7 +391,9 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
     if (ev.plan_estudio) {
       const planesRes = await pool.query('SELECT planes_usados FROM usuarios WHERE id = $1', [req.user.id])
       const planesUsados = planesRes.rows[0]?.planes_usados || 0
-      if (planesUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados })
+      const limiteResP = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+      const limiteGlobalP = limiteResP.rows.length ? parseInt(limiteResP.rows[0].valor) : 100
+      if (planesUsados >= limiteGlobalP) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados, limite: limiteGlobalP })
     }
     const textoLimpio = textoArchivos.replace(/--- Archivo:.*\(no se pudo extraer texto\) ---/g, '').replace(/--- Archivo:.*\(formato no soportado\) ---/g, '').trim()
     if (textoArchivos && !textoLimpio) {
@@ -809,7 +811,9 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, async (req, res) => {
       ORDER BY p.created_at DESC LIMIT 10
     `, [uid])
 
-    res.json({ ramos, podcasts })
+    const limiteRes = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limiteGlobal = limiteRes.rows.length ? parseInt(limiteRes.rows[0].valor) : 100
+    res.json({ ramos, podcasts, limiteGlobal })
   } catch(err) { console.error('ERROR DETALLE:', err.message); res.status(500).json({ error: err.message }) }
 })
 
@@ -824,6 +828,28 @@ app.delete('/admin/usuario/:id', authenticateToken, async (req, res) => {
 })
 
 // Reset contadores de un usuario (solo admin)
+app.post('/admin/limite-global', authenticateToken, async (req, res) => {
+  try {
+    const { limite } = req.body
+    if (typeof limite !== 'number' || limite < 0) return res.status(400).json({ error: 'Límite inválido' })
+    await pool.query("INSERT INTO configuracion (clave, valor) VALUES ('limite_global', $1) ON CONFLICT (clave) DO UPDATE SET valor = $1", [String(limite)])
+    res.json({ ok: true, limite })
+  } catch(e) {
+    console.error(e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/admin/limite-global', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limite = rows.length ? parseInt(rows[0].valor) : 100
+    res.json({ limite })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.post('/admin/reset-contadores', authenticateToken, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
@@ -1030,7 +1056,9 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     const tareaIdx = req.body.tareaIdx ?? null
     const userRes = await pool.query('SELECT podcasts_usados FROM usuarios WHERE id = $1', [userId])
     const usados = userRes.rows[0]?.podcasts_usados || 0
-    if (usados >= 100) return res.status(403).json({ error: 'limite_alcanzado', usados })
+    const limiteRes = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limiteGlobal = limiteRes.rows.length ? parseInt(limiteRes.rows[0].valor) : 100
+    if (usados >= limiteGlobal) return res.status(403).json({ error: 'limite_alcanzado', usados, limite: limiteGlobal })
     const evRes = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre, e.texto_material, e.plan_estudio FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2`,
       [evId, userId]
@@ -1076,16 +1104,35 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     let guion
     try { guion = JSON.parse(guionRes.choices[0].message.content) }
     catch(e) { return res.status(500).json({ error: 'Error generando guion' }) }
-    const voces = { ana: 'nova', carlos: 'echo' }
+    const voces = {
+      ana: 'ajOR9IDAaubDK5qtLUqQ',
+      carlos: '4g0zcFn3Yhp86jjySzFf'
+    }
     const audioBuffers = []
+    const elevenLabsKey = process.env.ELEVENLABS_API_KEY
     for (const seg of guion.segmentos) {
-      const audio = await openai.audio.speech.create({
-        model: 'tts-1',
-        voice: voces[seg.voz] || 'alloy',
-        input: seg.texto,
-        response_format: 'mp3'
+      const voiceId = voces[seg.voz] || voces.ana
+      const voiceSettings = seg.voz === 'ana'
+        ? { stability: 0.55, similarity_boost: 0.75, style: 0.15, use_speaker_boost: true }
+        : { stability: 0.45, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true }
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': elevenLabsKey,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg'
+        },
+        body: JSON.stringify({
+          text: seg.texto,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: voiceSettings
+        })
       })
-      audioBuffers.push(Buffer.from(await audio.arrayBuffer()))
+      if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`ElevenLabs error: ${response.status} - ${errText}`)
+      }
+      audioBuffers.push(Buffer.from(await response.arrayBuffer()))
     }
     const audioFinal = Buffer.concat(audioBuffers)
     await pool.query('UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1', [userId])
@@ -1259,7 +1306,9 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     // BLOQUEO: límite quizzes (solo nuevas generaciones, no cache)
     const quizzesRes = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
     const quizzesUsados = quizzesRes.rows[0]?.quizzes_usados || 0
-    if (quizzesUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados })
+    const limiteResQ = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limiteGlobalQ = limiteResQ.rows.length ? parseInt(limiteResQ.rows[0].valor) : 100
+    if (quizzesUsados >= limiteGlobalQ) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados, limite: limiteGlobalQ })
     // Usar texto ya extraído si existe
     let textoArchivos = ev.texto_material || ''
     if (!textoArchivos && (!ev.archivos || ev.archivos.length === 0)) {
@@ -1347,7 +1396,9 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
     // BLOQUEO: límite ejercicios
     const ejerciciosRes = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
     const ejerciciosUsados = ejerciciosRes.rows[0]?.ejercicios_usados || 0
-    if (ejerciciosUsados >= 100) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados })
+    const limiteResE = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limiteGlobalE = limiteResE.rows.length ? parseInt(limiteResE.rows[0].valor) : 100
+    if (ejerciciosUsados >= limiteGlobalE) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados, limite: limiteGlobalE })
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -1490,12 +1541,14 @@ Responde SOLO con JSON válido:
       doc.fontSize(10).fillColor(GRAY).font('Helvetica-Bold').text('Tu respuesta:', 50, doc.y)
       doc.moveDown(0.4)
       // Líneas para escribir
+      const lineStartY = doc.y
       for (let l = 0; l < 5; l++) {
-        const ly = doc.y + l * 22
+        const ly = lineStartY + l * 22
         if (ly < PAGE_H - 60) {
           doc.rect(50, ly, W, 1).fill('#2a2a4a')
         }
       }
+      doc.y = lineStartY + 5 * 22
 
       // Footer
       doc.fontSize(8).fillColor(GRAY).text(`${ev.ramo_nombre}  ·  APPrueba`, 50, PAGE_H - 30, { width: W, align: 'center' })
