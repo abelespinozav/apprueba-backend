@@ -174,10 +174,10 @@ app.get('/auth/google/callback',
 )
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados FROM usuarios WHERE id = $1', [req.user.id])
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
-  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2 }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -459,7 +459,7 @@ app.post('/auth/onboarding', authenticateToken, async (req, res) => {
     const { nombre, universidad, carrera } = req.body
     if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es requerido' })
     const { rows } = await pool.query(
-      'UPDATE usuarios SET nombre = $1, universidad = $2, carrera = $3, onboarding_completado = true WHERE id = $4 RETURNING id, nombre, email, avatar, universidad, carrera, onboarding_completado',
+      'UPDATE usuarios SET nombre = $1, universidad = $2, carrera = $3, onboarding_completado = true, onboarding_v2 = true WHERE id = $4 RETURNING id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2',
       [nombre.trim(), universidad || null, carrera ? carrera.trim() : null, req.user.id]
     )
     res.json({ usuario: rows[0] })
