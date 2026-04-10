@@ -27,7 +27,7 @@ webpush.setVapidDetails(
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } })
 
 app.set('trust proxy', 1)
 
