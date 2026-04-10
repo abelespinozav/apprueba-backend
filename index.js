@@ -1320,8 +1320,8 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     for (const seg of guion.segmentos) {
       const voiceId = voces[seg.voz] || voces.constanza
       const voiceSettings = seg.voz === 'constanza'
-        ? { stability: 0.55, similarity_boost: 0.75, style: 0.15, use_speaker_boost: true, speed: 1.15 }
-        : { stability: 0.45, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true, speed: 1.15 }
+        ? { stability: 0.55, similarity_boost: 0.75, style: 0.15, use_speaker_boost: true, speed: 1.05 }
+        : { stability: 0.45, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true, speed: 1.05 }
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
         method: 'POST',
         headers: {
