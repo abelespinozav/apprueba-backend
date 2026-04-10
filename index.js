@@ -1475,7 +1475,7 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
       }
     }
     const updated = await pool.query(
-      `SELECT r.*, json_agg(json_build_object('id',e.id,'nombre',e.nombre,'ponderacion',e.ponderacion,'nota',e.nota,'fecha',e.fecha) ORDER BY e.id) as evaluaciones FROM ramos r LEFT JOIN evaluaciones e ON e.ramo_id = r.id WHERE r.id=$1 GROUP BY r.id`,
+      `SELECT r.*, COALESCE(json_agg(json_build_object('id',e.id,'nombre',e.nombre,'ponderacion',e.ponderacion,'nota',e.nota,'fecha',e.fecha,'plan_estudio',e.plan_estudio,'tareas_completadas',e.tareas_completadas,'archivos',COALESCE((SELECT json_agg(json_build_object('id',a.id,'nombre',a.nombre,'tipo',a.tipo)) FROM archivos a WHERE a.evaluacion_id = e.id),'[]'::json)) ORDER BY e.id) FILTER (WHERE e.id IS NOT NULL),'[]'::json) as evaluaciones FROM ramos r LEFT JOIN evaluaciones e ON e.ramo_id = r.id WHERE r.id=$1 GROUP BY r.id`,
       [req.params.id]
     )
     res.json(updated.rows[0])
