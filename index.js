@@ -1312,8 +1312,8 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     try { guion = JSON.parse(guionRes.choices[0].message.content) }
     catch(e) { return res.status(500).json({ error: 'Error generando guion' }) }
     const voces = {
-      constanza: 'ajOR9IDAaubDK5qtLUqQ',
-      benjamin: '4g0zcFn3Yhp86jjySzFf'
+      constanza: 'imFXYz8XIletRKLZZQaA',
+      benjamin: 'XgQWNZcJ8SRkxXwwhPTo'
     }
     const audioBuffers = []
     const elevenLabsKey = process.env.ELEVENLABS_API_KEY
