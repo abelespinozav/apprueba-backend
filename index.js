@@ -1402,31 +1402,41 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
       contenidoArchivos = `\nEl estudiante ha subido los siguientes archivos de estudio: ${ev.archivos.map(a => a.nombre).join(', ')}. Usa estos temas como contexto.`
     }
 
-    const prompt = `Eres un tutor universitario experto. Genera una guía de estudio detallada para un estudiante universitario chileno.
+    const prompt = `Eres el mejor tutor universitario del mundo — un experto que combina la claridad de Richard Feynman, la pedagogía de un profesor que realmente se preocupa por sus estudiantes, y la capacidad de hacer que cualquier tema sea fascinante. Tu misión es generar una guía de estudio TAN BUENA que el estudiante diga "¡WOW, esto es espectacular!".
 
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
 Tarea a estudiar: ${tarea.titulo}
 Descripción: ${tarea.descripcion}${contenidoArchivos}
 
+INSTRUCCIONES CRÍTICAS PARA UNA GUÍA ESPECTACULAR:
+- Usa analogías creativas y memorables con situaciones de la vida cotidiana chilena
+- Incluye trucos mnemotécnicos, acrónimos o frases para recordar conceptos difíciles
+- Explica el "¿por qué importa esto?" — conecta el tema con aplicaciones reales
+- En los ejemplos, muestra el razonamiento paso a paso como si fuera una conversación
+- Usa un tono cercano, motivador y directo (tutéalo al estudiante)
+- Los ejercicios deben ir de menor a mayor dificultad, con pistas inteligentes
+- El resumen debe ser una "cheat sheet" mental ultra-práctica para el día del examen
+
 Responde SOLO con un JSON válido (sin markdown, sin bloques de código):
 {
-  "titulo": "título de la guía",
-  "introduccion": "párrafo introductorio del tema",
+  "titulo": "título atractivo y específico de la guía",
+  "introduccion": "párrafo motivador que explica por qué este tema es importante y cómo conecta con la vida real — máximo 3 oraciones poderosas",
   "conceptos_clave": [
-    { "termino": "nombre del concepto", "definicion": "explicación clara y concisa" }
+    { "termino": "nombre del concepto", "definicion": "explicación clara con analogía de la vida cotidiana", "truco": "truco mnemotécnico o frase para recordarlo fácil" }
   ],
-  "desarrollo": "explicación detallada del tema en 3-4 párrafos",
+  "desarrollo": "explicación profunda del tema en 4-5 párrafos, usando ejemplos concretos, analogías y conectando ideas entre sí. Debe sentirse como una conversación con un tutor experto, no como un libro de texto",
   "ejemplos": [
-    { "enunciado": "enunciado del ejemplo", "solucion": "solución paso a paso" }
+    { "enunciado": "problema concreto y realista", "solucion": "solución paso a paso explicando el RAZONAMIENTO detrás de cada paso, no solo los cálculos", "insight": "qué aprender de este ejemplo para el examen" }
   ],
   "ejercicios_practica": [
-    { "enunciado": "enunciado del ejercicio", "pista": "pista para resolverlo" }
+    { "enunciado": "ejercicio desafiante pero alcanzable", "pista": "pista que guía sin revelar la respuesta", "nivel": "básico/intermedio/avanzado" }
   ],
-  "resumen_final": "resumen en 2-3 puntos clave para recordar"
+  "conexiones": "cómo este tema se relaciona con otros temas del ramo o con situaciones del mundo real — 2-3 conexiones que amplían la comprensión",
+  "resumen_final": "cheat sheet mental: 4-5 puntos CLAVE ultra-concretos para recordar en el examen, en formato de frases cortas y poderosas"
 }
 
-Genera 3 conceptos clave, 2 ejemplos resueltos y 3 ejercicios de práctica.`
+Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con insights, y 3 ejercicios de práctica (uno básico, uno intermedio, uno avanzado).`
 
     const result = await openai.chat.completions.create({
       model: 'gpt-4o',
