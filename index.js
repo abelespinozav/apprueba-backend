@@ -238,7 +238,7 @@ app.get('/ramos', authenticateToken, async (req, res) => {
           FROM archivos a WHERE a.evaluacion_id = e.id
         )
       ) ORDER BY e.id
-    ) as evaluaciones
+    ) FILTER (WHERE e.id IS NOT NULL) as evaluaciones
      FROM ramos r
      LEFT JOIN evaluaciones e ON e.ramo_id = r.id
      WHERE r.usuario_id = $1
