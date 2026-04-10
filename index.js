@@ -1299,12 +1299,12 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       model: 'gpt-4o',
       messages: [{
         role: 'system',
-        content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Ana" (profesora entusiasta y experta) y "Carlos" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 15 minutos. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "ana"|"carlos", "texto": "..." }] }. Mínimo 60 segmentos, máximo 80. Cada segmento debe tener al menos 3-4 oraciones completas y detalladas. Estructura: introducción motivadora (5 seg), desarrollo profundo por subtemas con ejemplos reales (45 seg), preguntas y respuestas entre Ana y Carlos (10 seg), conclusión y consejos para el examen (5 seg). Habla natural, usa analogías, ejemplos cotidianos y humor ocasional.'
+        content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Constanza" (profesora entusiasta y experta) y "Benjamín" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 7 minutos. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "constanza"|"benjamin", "texto": "..." }] }. Mínimo 28 segmentos, máximo 35. Cada segmento debe tener 2-3 oraciones completas. Estructura: introducción motivadora (5 seg), desarrollo profundo por subtemas con ejemplos reales (45 seg), preguntas y respuestas entre Constanza y Benjamín (8 seg), conclusión y consejos para el examen (4 seg). Habla natural, usa analogías, ejemplos cotidianos y humor ocasional.'
       }, {
         role: 'user',
         content: material
-        ? 'Crea un podcast educativo de EXACTAMENTE 15 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 12000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener mínimo 60 segmentos, cada uno con 3-4 oraciones. No resumas, desarrolla cada concepto en detalle como si fuera una clase completa.'
-        : 'Crea un podcast educativo de EXACTAMENTE 15 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Mínimo 60 segmentos, cada uno con 3-4 oraciones detalladas.'
+        ? 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 12000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener entre 28 y 35 segmentos, cada uno con 2-3 oraciones. Sé conciso pero claro.'
+        : 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Entre 28 y 35 segmentos, cada uno con 2-3 oraciones.'
       }],
       response_format: { type: 'json_object' }
     })
@@ -1312,14 +1312,14 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     try { guion = JSON.parse(guionRes.choices[0].message.content) }
     catch(e) { return res.status(500).json({ error: 'Error generando guion' }) }
     const voces = {
-      ana: 'ajOR9IDAaubDK5qtLUqQ',
-      carlos: '4g0zcFn3Yhp86jjySzFf'
+      constanza: 'ajOR9IDAaubDK5qtLUqQ',
+      benjamin: '4g0zcFn3Yhp86jjySzFf'
     }
     const audioBuffers = []
     const elevenLabsKey = process.env.ELEVENLABS_API_KEY
     for (const seg of guion.segmentos) {
-      const voiceId = voces[seg.voz] || voces.ana
-      const voiceSettings = seg.voz === 'ana'
+      const voiceId = voces[seg.voz] || voces.constanza
+      const voiceSettings = seg.voz === 'constanza'
         ? { stability: 0.55, similarity_boost: 0.75, style: 0.15, use_speaker_boost: true }
         : { stability: 0.45, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true }
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
@@ -1331,7 +1331,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
         },
         body: JSON.stringify({
           text: seg.texto,
-          model_id: 'eleven_multilingual_v2',
+          model_id: 'eleven_turbo_v2_5',
           voice_settings: voiceSettings
         })
       })
