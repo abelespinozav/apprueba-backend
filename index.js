@@ -323,12 +323,15 @@ app.delete('/archivos/:id', authenticateToken, async (req, res) => {
 // Generar plan de estudio con IA
 app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('archivo', 10), async (req, res) => {
   try {
+    // Validar y parsear ID
+    const evalId = parseInt(req.params.id, 10)
+    if (!evalId || isNaN(evalId)) return res.status(400).json({ error: 'id_invalido', mensaje: 'ID de evaluación inválido' })
     // Guardar archivos nuevos en BD antes de generar plan
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
-        const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [req.params.id, file.originalname])
+        const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [evalId, file.originalname])
         if (existe.length === 0) {
-          await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [req.params.id, file.originalname, file.mimetype, file.buffer])
+          await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [evalId, file.originalname, file.mimetype, file.buffer])
         }
       }
     }
@@ -338,7 +341,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
          FROM archivos a WHERE a.evaluacion_id = e.id) as archivos
        FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
        WHERE e.id = $1 AND r.usuario_id = $2`,
-      [req.params.id, req.user.id]
+      [evalId, req.user.id]
     )
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
@@ -435,17 +438,17 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       const jsonMatch = text.match(/\{[\s\S]*\}/)
       if (!jsonMatch) throw new Error('No JSON')
       const plan = JSON.parse(jsonMatch[0])
-      await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2 WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, req.params.id])
+      await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2 WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
       if (ev.plan_estudio) {
         await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [req.user.id])
       }
       // Guardar archivos en tabla archivos si no existen ya
       if (ev.archivos && ev.archivos.length > 0) {
         for (const archivo of ev.archivos) {
-          const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [req.params.id, archivo.nombre])
+          const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [evalId, archivo.nombre])
           if (existe.length === 0) {
             const buffer = Buffer.from(archivo.datos, 'base64')
-            await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [req.params.id, archivo.nombre, archivo.tipo, buffer])
+            await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [evalId, archivo.nombre, archivo.tipo, buffer])
           }
         }
       }
@@ -463,7 +466,7 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
       const plan2 = JSON.parse(jsonMatch2[0])
       if (!textoArchivos) plan2._archivoNoProcessado = true
-      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), req.params.id])
+      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), evalId])
       return res.json(plan2)
     }
 
