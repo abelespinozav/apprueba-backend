@@ -11,7 +11,7 @@ const multer = require('multer')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const webpush = require('web-push')
 const cron = require('node-cron')
-const pdfParse = require('pdf-parse')
+const { extraerTextoPDF, pdfAImagenes } = require('./pdfExtractor')
 const mammoth = require('mammoth')
 const { pdf2pic } = require('pdf2pic')
 const sharp = require('sharp')
@@ -154,8 +154,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
   // ── PDF ──
   if (tipo?.includes('pdf') || ext === 'pdf') {
     try {
-      const parsed = await pdfParse(buffer)
-      const texto = parsed.text?.trim()
+      const texto = await extraerTextoPDF(buffer)?.trim()
       if (texto && texto.length > 100) {
         console.log(`📄 PDF texto extraído: ${texto.slice(0,200)}`)
         return texto.slice(0, 15000)
@@ -164,7 +163,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
       console.log(`🔍 PDF escaneado, usando Vision...`)
       const tmpPdf = path.join(os.tmpdir(), `apprueba_${Date.now()}.pdf`)
       fs.writeFileSync(tmpPdf, buffer)
-      const converter = pdf2pic.fromPath(tmpPdf, { density: 150, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
+      const converter = pdf2pic.fromPath(tmpPdf, { density: 300, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
       const pages = await converter.bulk(-1, { responseType: 'base64' })
       fs.unlinkSync(tmpPdf)
       const imagenes = pages.slice(0, 5).map(p => ({
@@ -563,6 +562,13 @@ app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
   const { nota } = req.body
   await pool.query('UPDATE evaluaciones SET nota = $1 WHERE id = $2', [nota || null, req.params.id])
   res.json({ ok: true })
+})
+
+app.delete('/ramos/limpiar-todos', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM ramos WHERE usuario_id = $1', [req.user.id])
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.delete('/ramos/:id', authenticateToken, async (req, res) => {
@@ -1031,8 +1037,27 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
 app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se subió imagen' })
-    const base64 = req.file.buffer.toString('base64')
-    const mime = req.file.mimetype
+
+    let imagenesParaVision = []
+
+    if (req.file.mimetype === 'application/pdf') {
+      const { execSync } = require('child_process')
+      const tmp = '/tmp/horario_' + Date.now()
+      fs.writeFileSync(tmp + '.pdf', req.file.buffer)
+      execSync(`pdftoppm -png -r 200 ${tmp}.pdf ${tmp}`)
+      const pngs = fs.readdirSync('/tmp').filter(f => f.startsWith('horario_') && f.endsWith('.png') && f.includes(tmp.split('/tmp/')[1]))
+      pngs.sort()
+      imagenesParaVision = pngs.map(f => {
+        const b64 = fs.readFileSync('/tmp/' + f).toString('base64')
+        fs.unlinkSync('/tmp/' + f)
+        return { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}`, detail: 'high' } }
+      })
+      fs.unlinkSync(tmp + '.pdf')
+    } else {
+      const base64 = req.file.buffer.toString('base64')
+      const mime = req.file.mimetype
+      imagenesParaVision = [{ type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' } }]
+    }
 
     // PASO 1: Transcribir la tabla en texto plano
     const paso1 = await openai.chat.completions.create({
@@ -1040,74 +1065,24 @@ app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (
       messages: [{
         role: 'user',
         content: [
+          ...imagenesParaVision,
           {
             type: 'text',
-            text: `Lee esta imagen de un horario universitario y transcribe EXACTAMENTE lo que ves en cada celda de la tabla.
-            
-Para cada celda NO vacía, escribe una línea con este formato exacto:
-PERIODO | DIA | CODIGO | NOMBRE_RAMO | SALA | COLOR
-
-Donde COLOR es: naranja=topon, verde=ayudantia, naranja_fuerte=prueba, blanco/azul=clase
-
-Ejemplo:
-1° | Martes | IME086-6 | ALGEBRA LINEAL | RA-2003 | clase
-5° | Lunes | ICF177-8 | FÍSICA II | R2-202 | topon
-
-No omitas ninguna celda. No inventes nada. Solo transcribe lo que ves.`
-          },
-          { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } }
+            text: `Extrae todos los bloques de clase de este horario universitario chileno. Procesa cada columna de día de forma independiente. Responde SOLO con JSON array sin markdown:
+[{"dia":"Lunes","hora_inicio":"08:00","hora_fin":"09:10","ramo_nombre":"MATEMÁTICA","sala":"TRSR-602","tipo":"clase"}]`
+          }
         ]
       }],
       max_tokens: 2000
     })
 
     const transcripcion = paso1.choices[0].message.content
-    console.log('📋 Transcripción:\n', transcripcion)
-
-    // PASO 2: Convertir transcripción a JSON
-    const periodos = {
-      '1°': { inicio: '08:30', fin: '09:30' },
-      '2°': { inicio: '09:40', fin: '10:40' },
-      '3°': { inicio: '10:50', fin: '11:50' },
-      '4°': { inicio: '12:00', fin: '13:00' },
-      'Alm.': { inicio: '13:10', fin: '14:10' },
-      '5°': { inicio: '14:30', fin: '15:30' },
-      '6°': { inicio: '15:40', fin: '16:40' },
-      '7°': { inicio: '16:50', fin: '17:50' },
-      '8°': { inicio: '18:00', fin: '19:00' },
-      '9°': { inicio: '19:10', fin: '20:10' },
-      '10°': { inicio: '20:20', fin: '21:20' }
-    }
-
-    const paso2 = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [{
-        role: 'user',
-        content: `Convierte esta transcripción de horario universitario a un JSON array.
-
-Transcripción:
-${transcripcion}
-
-Tabla de períodos:
-${Object.entries(periodos).map(([p, h]) => `${p}: ${h.inicio}-${h.fin}`).join('\n')}
-
-Para cada línea de la transcripción, crea un objeto JSON:
-{ "dia": "Lunes", "hora_inicio": "08:30", "hora_fin": "09:30", "ramo_nombre": "ÁLGEBRA LINEAL", "codigo": "IME086-6", "sala": "RA-2003", "tipo": "clase" }
-
-Dias válidos: Lunes, Martes, Miércoles, Jueves, Viernes, Sábado
-tipo válidos: clase, topon, ayudantia, prueba, otra
-
-Responde SOLO con el JSON array, sin markdown.`
-      }],
-      max_tokens: 2000
-    })
-
-    const text = paso2.choices[0].message.content
-    const jsonMatch = text.match(/\[[\s\S]*\]/)
+    console.log('📋 Resultado GPT:\n', transcripcion)
+    const jsonMatch = transcripcion.match(/\[[\s\S]*\]/)
     if (!jsonMatch) return res.status(400).json({ error: 'No se pudo extraer el horario' })
     const bloques = JSON.parse(jsonMatch[0])
     res.json({ bloques })
-  } catch(err) { res.status(500).json({ error: err.message }) }
+  } catch(err) { console.error('❌ Error horario/extraer:', err); res.status(500).json({ error: err.message }) }
 })
 
 // Panel admin - solo abelespinozav@gmail.com
@@ -1648,7 +1623,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
         try {
           const buf = Buffer.isBuffer(archivo.datos) ? archivo.datos : Buffer.from(archivo.datos)
           if (archivo.tipo === 'application/pdf') {
-            const parsed = await pdfParse(buf)
+            const parsed = { text: await extraerTextoPDF(buf) }
             material += parsed.text + ' '
           } else if (archivo.tipo && archivo.tipo.includes('word')) {
             const result = await mammoth.extractRawText({ buffer: buf })
@@ -1907,7 +1882,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
         try {
           const buffer = Buffer.from(archivo.datos, 'base64')
           if (archivo.tipo && archivo.tipo.includes('pdf')) {
-            const parsed = await pdfParse(buffer)
+            const parsed = { text: await extraerTextoPDF(buffer) }
             textoArchivos += `\n\n--- ${archivo.nombre} ---\n${parsed.text.slice(0, 10000)}`
           } else if (archivo.tipo && (archivo.tipo.includes('word') || archivo.tipo.includes('docx') || archivo.nombre?.endsWith('.docx'))) {
             const result = await mammoth.extractRawText({ buffer })
