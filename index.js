@@ -991,7 +991,7 @@ app.get('/notificaciones/vapid-key', (req, res) => {
 })
 
 // ── CRON JOB — todos los días a las 9:00 AM Chile (UTC-3) ────────
-cron.schedule('0 12 * * *', async () => {
+cron.schedule('0 8 * * *', async () => {
   console.log('🔔 Cron notificaciones ejecutándose...')
   try {
     // Obtener todas las evaluaciones con fecha futura y sus configs
@@ -1082,6 +1082,17 @@ cron.schedule('*/15 * * * *', async () => {
     `, [diaHoy, horaAhora, hora15])
 
     for (const row of rows) {
+      // Deduplicar: no enviar dos veces el mismo aviso
+      const claveClase = `clase_${row.usuario_id}_${diaHoy}_${row.hora_inicio}_${row.ramo_nombre}`
+      try {
+        await pool.query(
+          'INSERT INTO notif_enviadas (usuario_id, clave) VALUES ($1, $2)',
+          [row.usuario_id, claveClase]
+        )
+      } catch(e) {
+        if (e.code === '23505') continue
+        throw e
+      }
       const { rows: subs } = await pool.query(
         'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
         [row.usuario_id]
@@ -1110,66 +1121,73 @@ cron.schedule('*/15 * * * *', async () => {
 }, { timezone: 'America/Santiago' })
 
 // ── CRON — Ventanas de estudio (8:00 AM Chile) ───────────────────
-cron.schedule('0 11 * * *', async () => {
+
+// ── CRON — Ventanas de estudio (dinámico: avisa 30 min antes de la mejor ventana) ──
+cron.schedule('*/30 7-22 * * *', async () => {
   try {
     const ahora = new Date()
     const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado']
     const diaHoy = diasSemana[ahora.getDay()]
+    const horaAhora = ahora.toTimeString().slice(0,5)
 
-    // Obtener usuarios con notificaciones activas
     const { rows: usuarios } = await pool.query(`
-      SELECT DISTINCT nc.usuario_id
+      SELECT nc.usuario_id
       FROM notificacion_config nc
-      WHERE nc.activo = true
-        AND nc.notif_ventanas = true
+      WHERE nc.activo = true AND nc.notif_ventanas = true
     `)
 
     for (const u of usuarios) {
-      // Obtener horario de hoy
       const { rows: clases } = await pool.query(`
         SELECT hora_inicio, hora_fin FROM horario
         WHERE usuario_id = $1 AND dia = $2
         ORDER BY hora_inicio
       `, [u.usuario_id, diaHoy])
 
-      // Detectar ventanas libres de 1h+ entre 8:00 y 22:00
+      const toMin = t => { const [h,m] = t.split(':').map(Number); return h*60+m }
+      const fromMin = m => String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0')
+
+      const bloques = [
+        { hora_inicio: '07:00', hora_fin: '07:00' },
+        ...clases,
+        { hora_inicio: '23:00', hora_fin: '23:00' }
+      ]
+
       const ventanas = []
-      const bloques = [{ hora_inicio: '08:00', hora_fin: '08:00' }, ...clases, { hora_inicio: '22:00', hora_fin: '22:00' }]
-      
-      for (let i = 0; i < bloques.length - 1; i++) {
-        const finAnterior = bloques[i].hora_fin
-        const inicioSiguiente = bloques[i+1].hora_inicio
-        const [fh, fm] = finAnterior.split(':').map(Number)
-        const [ih, im] = inicioSiguiente.split(':').map(Number)
-        const durMin = (ih * 60 + im) - (fh * 60 + fm)
-        if (durMin >= 60) {
+      for (let j = 0; j < bloques.length - 1; j++) {
+        const finAnterior = bloques[j].hora_fin
+        const inicioSiguiente = bloques[j+1].hora_inicio
+        const durMin = toMin(inicioSiguiente) - toMin(finAnterior)
+        if (durMin >= 60 && finAnterior >= horaAhora) {
           ventanas.push({ desde: finAnterior, hasta: inicioSiguiente, durMin })
         }
       }
 
       if (ventanas.length === 0) continue
 
-      // Obtener evaluación más próxima
-      const { rows: evals } = await pool.query(`
-        SELECT e.nombre, r.nombre as ramo_nombre, e.fecha
-        FROM evaluaciones e
-        JOIN ramos r ON r.id = e.ramo_id
-        WHERE r.usuario_id = $1
-          AND e.fecha >= CURRENT_DATE
-          AND e.nota IS NULL
-        ORDER BY e.fecha ASC
-        LIMIT 1
-      `, [u.usuario_id])
+      // Tomar la próxima ventana libre
+      const proxVentana = ventanas[0]
+      const minutosHasta = toMin(proxVentana.desde) - toMin(horaAhora)
 
-      const mejorVentana = ventanas.sort((a,b) => b.durMin - a.durMin)[0]
-      const horas = Math.floor(mejorVentana.durMin / 60)
-      const mins = mejorVentana.durMin % 60
-      const durTexto = mins > 0 ? `${horas}h ${mins}min` : `${horas}h`
+      // Avisar solo si la ventana empieza en los próximos 30 min
+      if (minutosHasta < 0 || minutosHasta > 30) continue
 
-      let body = `Tienes ${durTexto} libres de ${mejorVentana.desde} a ${mejorVentana.hasta}`
-      if (evals.length > 0) {
-        body += ` · Aprovecha para estudiar ${evals[0].ramo_nombre}`
+      // Deduplicar: no enviar dos veces el mismo aviso
+      const clave = `ventana_${u.usuario_id}_${diaHoy}_${proxVentana.desde}`
+      try {
+        await pool.query(
+          'INSERT INTO notif_enviadas (usuario_id, clave) VALUES ($1, $2)',
+          [u.usuario_id, clave]
+        )
+      } catch(e) {
+        if (e.code === '23505') continue // ya enviada
+        throw e
       }
+
+      const durHoras = Math.floor(proxVentana.durMin / 60)
+      const durMins = proxVentana.durMin % 60
+      const durTexto = durHoras > 0
+        ? (durMins > 0 ? `${durHoras}h ${durMins}min` : `${durHoras}h`)
+        : `${durMins}min`
 
       const { rows: subs } = await pool.query(
         'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
@@ -1178,11 +1196,14 @@ cron.schedule('0 11 * * *', async () => {
 
       for (const sub of subs) {
         try {
-          await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify({
-            title: '📖 Ventana de estudio disponible',
-            body,
-            icon: '/icon-192.png'
-          }))
+          await webpush.sendNotification(
+            { endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: { p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth } },
+            JSON.stringify({
+              title: '📖 Ventana de estudio',
+              body: `Tienes ${durTexto} libres desde las ${proxVentana.desde} hasta las ${proxVentana.hasta}. ¡Buen momento para estudiar!`,
+              icon: '/icon-192.png'
+            })
+          )
         } catch(e) {
           if (e.statusCode === 410) {
             await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
@@ -1191,9 +1212,20 @@ cron.schedule('0 11 * * *', async () => {
       }
     }
   } catch(err) {
-    console.error('❌ Error cron ventanas estudio:', err.message)
+    console.error('❌ Error cron ventanas dinámico:', err.message)
   }
 }, { timezone: 'America/Santiago' })
+
+// ── CRON — Limpieza notif_enviadas (cada día a las 00:05) ────────
+cron.schedule('5 0 * * *', async () => {
+  try {
+    await pool.query("DELETE FROM notif_enviadas WHERE enviada_at < NOW() - INTERVAL '2 days'")
+    console.log('🧹 notif_enviadas limpiada')
+  } catch(err) {
+    console.error('❌ Error limpieza notif_enviadas:', err.message)
+  }
+}, { timezone: 'America/Santiago' })
+
 
 
 
