@@ -13,9 +13,290 @@ const webpush = require('web-push')
 const cron = require('node-cron')
 const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
+const { pdf2pic } = require('pdf2pic')
+const sharp = require('sharp')
+const ffmpeg = require('fluent-ffmpeg')
+const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path
+// youtubei.js se importa dinámicamente (ES module)
+const fs = require('fs')
+const path = require('path')
+const { execSync, exec } = require('child_process')
+const os = require('os')
+ffmpeg.setFfmpegPath(ffmpegPath)
 const bcrypt = require('bcrypt')
 const OpenAI = require('openai')
 
+// Helper: enviar notificación push a usuario específico
+async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
+  try {
+    const { rows: subs } = await pool.query('SELECT subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
+    const payload = JSON.stringify({ title: titulo, body: cuerpo, url })
+    for (const row of subs) {
+      try {
+        const s = row.subscription
+        await webpush.sendNotification(
+          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
+          payload
+        )
+      } catch(e) { console.error('Push error:', e.message) }
+    }
+  } catch(e) { console.error('notificarUsuario error:', e.message) }
+}
+
+
+
+// ══════════════════════════════════════════════════════════════
+// EXTRACCIÓN UNIVERSAL DE CONTENIDO
+// Soporta: PDF (texto/escaneado), DOCX, XLSX, imagen, audio, video, YouTube
+// ══════════════════════════════════════════════════════════════
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+async function extraerContenido(archivo, enviar = () => {}) {
+  const { nombre, tipo, datos } = archivo
+  const ext = nombre ? nombre.split('.').pop().toLowerCase() : ''
+
+  // ── YouTube URL ──
+  if (archivo.youtubeUrl) {
+    const tmpAudio = path.join(os.tmpdir(), `yt_${Date.now()}.mp3`)
+    try {
+      const videoId = archivo.youtubeUrl.match(/(?:v=|youtu\.be\/)([\w-]{11})/)?.[1]
+      if (!videoId) return '(No se pudo extraer el ID del video de YouTube)'
+      console.log(`🎬 Descargando audio con yt-dlp: ${videoId}`)
+      enviar('progreso', { msg: `🎬 Procesando video de YouTube...` })
+      // Descargar audio en menor calidad posible para evitar límite 25MB
+      await new Promise((resolve, reject) => {
+        exec(
+          `yt-dlp -f "worstaudio" -x --audio-format mp3 --audio-quality 9 -o "${tmpAudio}" --no-playlist "${archivo.youtubeUrl}"`,
+          { timeout: 600000 },
+          (err, stdout, stderr) => {
+            if (err) reject(new Error(stderr || err.message))
+            else resolve(stdout)
+          }
+        )
+      })
+      // Verificar que el archivo existe (yt-dlp puede agregar extensión)
+      let audioFinal = tmpAudio
+      if (!fs.existsSync(audioFinal)) {
+        const alt = tmpAudio.replace('.mp3', '.mp3.mp3')
+        if (fs.existsSync(alt)) fs.renameSync(alt, audioFinal)
+        else throw new Error('Archivo de audio no generado')
+      }
+      // Si el archivo supera 24MB, dividir en chunks con ffmpeg
+      const audioSize = fs.statSync(audioFinal).size
+      const MAX_SIZE = 24 * 1024 * 1024
+      let transcripcionCompleta = ''
+      if (audioSize <= MAX_SIZE) {
+        console.log(`🎤 Transcribiendo audio de YouTube con Whisper...`)
+        enviar('progreso', { msg: '🎤 Transcribiendo audio...' })
+        const audioBuffer = fs.readFileSync(audioFinal)
+        fs.unlinkSync(audioFinal)
+        const whisperResp = await openaiClient.audio.transcriptions.create({
+          file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+          model: 'whisper-1',
+          language: 'es'
+        })
+        transcripcionCompleta = whisperResp.text
+      } else {
+        // Dividir en chunks de 15 minutos
+        console.log(`🎬 Audio grande (${Math.round(audioSize/1024/1024)}MB), dividiendo en chunks...`)
+        enviar('progreso', { msg: `🎬 Video largo detectado (${Math.round(audioSize/1024/1024)}MB), dividiendo en partes...` })
+        const chunkDir = `/tmp/chunks_${videoId}_${Date.now()}`
+        fs.mkdirSync(chunkDir, { recursive: true })
+        await new Promise((resolve, reject) => {
+          exec(
+            `ffmpeg -i "${audioFinal}" -f segment -segment_time 900 -c copy "${chunkDir}/chunk_%03d.mp3" -y`,
+            { timeout: 300000 },
+            (err) => { if (err) reject(err); else resolve() }
+          )
+        })
+        fs.unlinkSync(audioFinal)
+        const chunks = fs.readdirSync(chunkDir).filter(f => f.endsWith('.mp3')).sort()
+        console.log(`🎤 Transcribiendo ${chunks.length} chunks con Whisper...`)
+        enviar('progreso', { msg: `🎤 Transcribiendo ${chunks.length} partes del audio...` })
+        for (let i = 0; i < chunks.length; i++) {
+          const chunkPath = `${chunkDir}/${chunks[i]}`
+          console.log(`🎤 Chunk ${i+1}/${chunks.length}...`)
+          enviar('progreso', { msg: `🎤 Transcribiendo parte ${i+1} de ${chunks.length}...` })
+          const chunkBuffer = fs.readFileSync(chunkPath)
+          fs.unlinkSync(chunkPath)
+          const resp = await openaiClient.audio.transcriptions.create({
+            file: new File([chunkBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+            model: 'whisper-1',
+            language: 'es'
+          })
+          transcripcionCompleta += resp.text + ' '
+        }
+        try { fs.rmdirSync(chunkDir) } catch(_) {}
+      }
+      console.log(`🎬 YouTube transcrito completo: ${transcripcionCompleta.slice(0,200)}`)
+      enviar('progreso', { msg: '✅ Audio transcrito, analizando contenido...' })
+      return transcripcionCompleta
+    } catch(e) {
+      console.error('Error YouTube yt-dlp:', e.message)
+      if (fs.existsSync(tmpAudio)) fs.unlinkSync(tmpAudio)
+      // Fallback: intentar metadata con youtubei.js
+      try {
+        const { Innertube } = await import('youtubei.js')
+        const yt = await Innertube.create({ retrieve_player: false })
+        const info = await yt.getInfo(archivo.youtubeUrl.match(/(?:v=|youtu\.be\/)([\w-]{11})/)?.[1])
+        const titulo = info.basic_info?.title || ''
+        const descripcion = info.basic_info?.short_description || ''
+        console.log(`🎬 Fallback metadata: ${titulo}`)
+        return `Título: ${titulo}\n\nDescripción: ${descripcion}`.slice(0, 15000)
+      } catch(e2) {
+        return '(No se pudo procesar el video de YouTube)'
+      }
+    }
+  }
+
+  const buffer = Buffer.from(datos, 'base64')
+
+  // ── PDF ──
+  if (tipo?.includes('pdf') || ext === 'pdf') {
+    try {
+      const parsed = await pdfParse(buffer)
+      const texto = parsed.text?.trim()
+      if (texto && texto.length > 100) {
+        console.log(`📄 PDF texto extraído: ${texto.slice(0,200)}`)
+        return texto.slice(0, 15000)
+      }
+      // PDF escaneado → Vision
+      console.log(`🔍 PDF escaneado, usando Vision...`)
+      const tmpPdf = path.join(os.tmpdir(), `apprueba_${Date.now()}.pdf`)
+      fs.writeFileSync(tmpPdf, buffer)
+      const converter = pdf2pic.fromPath(tmpPdf, { density: 150, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
+      const pages = await converter.bulk(-1, { responseType: 'base64' })
+      fs.unlinkSync(tmpPdf)
+      const imagenes = pages.slice(0, 5).map(p => ({
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,${p.base64}`, detail: 'high' }
+      }))
+      const resp = await openaiClient.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: 'Extrae y transcribe todo el texto de estas páginas de apuntes universitarios. Incluye fórmulas, títulos, listas y todo el contenido relevante.' },
+          ...imagenes
+        ]}],
+        max_tokens: 4000
+      })
+      return resp.choices[0].message.content.slice(0, 15000)
+    } catch(e) {
+      console.error('Error PDF:', e.message)
+      return '(No se pudo procesar el PDF)'
+    }
+  }
+
+  // ── DOCX ──
+  if (tipo?.includes('word') || tipo?.includes('docx') || ext === 'docx' || ext === 'doc') {
+    try {
+      const result = await mammoth.extractRawText({ buffer })
+      console.log(`📝 DOCX extraído: ${result.value.slice(0,200)}`)
+      return result.value.slice(0, 15000)
+    } catch(e) {
+      console.error('Error DOCX:', e.message)
+      return '(No se pudo procesar el archivo Word)'
+    }
+  }
+
+  // ── XLSX / Excel ──
+  if (tipo?.includes('spreadsheet') || tipo?.includes('excel') || ext === 'xlsx' || ext === 'xls') {
+    try {
+      const wb = XLSX.read(buffer, { type: 'buffer' })
+      let texto = ''
+      wb.SheetNames.forEach(sheet => {
+        const ws = wb.Sheets[sheet]
+        texto += `\n--- Hoja: ${sheet} ---\n`
+        texto += XLSX.utils.sheet_to_csv(ws)
+      })
+      console.log(`📊 Excel extraído: ${texto.slice(0,200)}`)
+      return texto.slice(0, 15000)
+    } catch(e) {
+      console.error('Error Excel:', e.message)
+      return '(No se pudo procesar el archivo Excel)'
+    }
+  }
+
+  // ── Imagen (foto de apunte, captura, etc) ──
+  if (tipo?.includes('image') || ['png','jpg','jpeg','webp','gif','heic'].includes(ext)) {
+    try {
+      // Convertir a JPEG optimizado para Vision
+      const imgBuffer = await sharp(buffer).jpeg({ quality: 85 }).toBuffer()
+      const base64 = imgBuffer.toString('base64')
+      const resp = await openaiClient.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: 'Extrae y transcribe todo el texto de esta imagen de apuntes universitarios. Incluye fórmulas, diagramas descritos en texto, títulos y todo el contenido relevante para estudiar.' },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'high' } }
+        ]}],
+        max_tokens: 3000
+      })
+      console.log(`🖼️ Imagen procesada con Vision`)
+      return resp.choices[0].message.content.slice(0, 15000)
+    } catch(e) {
+      console.error('Error imagen Vision:', e.message)
+      return '(No se pudo procesar la imagen)'
+    }
+  }
+
+  // ── Audio (nota de voz, MP3, M4A, WAV) ──
+  if (tipo?.includes('audio') || ['mp3','m4a','wav','ogg','aac','opus','weba'].includes(ext)) {
+    try {
+      const tmpIn = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.${ext || 'mp3'}`)
+      const tmpMp3 = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.mp3`)
+      fs.writeFileSync(tmpIn, buffer)
+      await new Promise((resolve, reject) => {
+        ffmpeg(tmpIn).toFormat('mp3').on('end', resolve).on('error', reject).save(tmpMp3)
+      })
+      const audioBuffer = fs.readFileSync(tmpMp3)
+      fs.unlinkSync(tmpIn)
+      fs.unlinkSync(tmpMp3)
+      const { default: fetch } = await import('node-fetch').catch(() => ({ default: global.fetch }))
+      const FormData = (await import('form-data')).default
+      const form = new FormData()
+      form.append('file', audioBuffer, { filename: 'audio.mp3', contentType: 'audio/mpeg' })
+      form.append('model', 'whisper-1')
+      form.append('language', 'es')
+      const whisperResp = await openaiClient.audio.transcriptions.create({
+        file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+        model: 'whisper-1',
+        language: 'es'
+      })
+      console.log(`🎤 Audio transcrito: ${whisperResp.text.slice(0,200)}`)
+      return whisperResp.text.slice(0, 15000)
+    } catch(e) {
+      console.error('Error audio Whisper:', e.message)
+      return '(No se pudo transcribir el audio)'
+    }
+  }
+
+  // ── Video (MP4, MOV) ──
+  if (tipo?.includes('video') || ['mp4','mov','avi','mkv','webm'].includes(ext)) {
+    try {
+      const tmpVideo = path.join(os.tmpdir(), `apprueba_video_${Date.now()}.${ext || 'mp4'}`)
+      const tmpAudio = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.mp3`)
+      fs.writeFileSync(tmpVideo, buffer)
+      await new Promise((resolve, reject) => {
+        ffmpeg(tmpVideo).noVideo().audioCodec('libmp3lame').on('end', resolve).on('error', reject).save(tmpAudio)
+      })
+      const audioBuffer = fs.readFileSync(tmpAudio)
+      fs.unlinkSync(tmpVideo)
+      fs.unlinkSync(tmpAudio)
+      const whisperResp = await openaiClient.audio.transcriptions.create({
+        file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+        model: 'whisper-1',
+        language: 'es'
+      })
+      console.log(`🎥 Video transcrito: ${whisperResp.text.slice(0,200)}`)
+      return whisperResp.text.slice(0, 15000)
+    } catch(e) {
+      console.error('Error video:', e.message)
+      return '(No se pudo procesar el video)'
+    }
+  }
+
+  return '(Formato no soportado)'
+}
+// ══════════════════════════════════════════════════════════════
 const app = express()
 
 webpush.setVapidDetails(
@@ -322,10 +603,22 @@ app.delete('/archivos/:id', authenticateToken, async (req, res) => {
 
 // Generar plan de estudio con IA
 app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('archivo', 10), async (req, res) => {
+  // Configurar SSE
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders()
+  const enviar = (tipo, datos) => {
+    res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
+  }
+  const terminar = (tipo, datos) => {
+    res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
+    res.end()
+  }
   try {
     // Validar y parsear ID
     const evalId = parseInt(req.params.id, 10)
-    if (!evalId || isNaN(evalId)) return res.status(400).json({ error: 'id_invalido', mensaje: 'ID de evaluación inválido' })
+    if (!evalId || isNaN(evalId)) return terminar('error', { error: 'id_invalido', mensaje: 'ID de evaluación inválido' })
     // Guardar archivos nuevos en BD antes de generar plan
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
@@ -335,6 +628,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
         }
       }
     }
+    enviar('progreso', { msg: '📋 Cargando información de la evaluación...' })
     const { rows: evRows } = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre,
         (SELECT json_agg(json_build_object('nombre', a.nombre, 'tipo', a.tipo, 'datos', encode(a.datos, 'base64')))
@@ -377,39 +671,36 @@ Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin 
   ]
 }
 
-Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha DEBE ser el día y hora sugerida para estudiar esa tarea, en formato "Lunes 10:00-11:30", usando SOLO los bloques libres del horario.`
+Genera entre 5 y 10 tareas según la cantidad de contenido del material. Si el material tiene múltiples temas, DEBES cubrir TODOS los temas con al menos una tarea cada uno — no omitas ningún tema del material. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha DEBE ser el día y hora sugerida para estudiar esa tarea, en formato "Lunes 10:00-11:30", usando SOLO los bloques libres del horario.`
 
     // Extraer texto de los archivos`
     let textoArchivos = ''
     console.log('📎 Archivos encontrados:', ev.archivos ? ev.archivos.length : 0)
+    // Procesar archivos guardados
     if (ev.archivos && ev.archivos.length > 0) {
       for (const archivo of ev.archivos) {
-        if (archivo.datos) {
-          try {
-            const buffer = Buffer.from(archivo.datos, 'base64')
-            if (archivo.tipo && archivo.tipo.includes('pdf')) {
-              const parsed = await pdfParse(buffer)
-              console.log(`📄 Texto extraído de ${archivo.nombre}: ${parsed.text.slice(0,200)}`)
-              textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${parsed.text.slice(0, 8000)}`
-            } else if (archivo.tipo && (archivo.tipo.includes('word') || archivo.tipo.includes('docx') || archivo.nombre?.endsWith('.docx'))) {
-              const result = await mammoth.extractRawText({ buffer })
-              console.log(`📝 Texto extraído de docx ${archivo.nombre}: ${result.value.slice(0,200)}`)
-              textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${result.value.slice(0, 8000)}`
-            } else {
-              textoArchivos += `\n\n--- Archivo: ${archivo.nombre} (formato no soportado) ---`
-            }
-          } catch(e) {
-            console.error('Error extrayendo texto:', e.message)
-            textoArchivos += `\n\n--- Archivo: ${archivo.nombre} (no se pudo extraer texto) ---`
-          }
+        if (archivo.datos || archivo.youtubeUrl) {
+          enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre || 'archivo'}...` })
+          const contenido = await extraerContenido(archivo)
+          textoArchivos += `\n\n--- Contenido de ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
         }
       }
     }
+    // Procesar YouTube URLs enviadas en el request (puede ser string o array)
+    const youtubeUrlRaw = req.body.youtubeUrl || req.query.youtubeUrl
+    const youtubeUrlsArr = youtubeUrlRaw ? (Array.isArray(youtubeUrlRaw) ? youtubeUrlRaw : [youtubeUrlRaw]) : []
+    for (const yUrl of youtubeUrlsArr) {
+      if (yUrl && typeof yUrl === 'string' && yUrl.trim()) {
+        console.log('🎬 Procesando YouTube:', yUrl)
+        enviar('progreso', { msg: `🎬 Descargando audio del video de YouTube...` })
+        const contenido = await extraerContenido({ youtubeUrl: yUrl.trim(), nombre: 'Video YouTube' }, enviar)
+        textoArchivos += `\n\n--- Contenido de Video YouTube ---\n${contenido}`
+      }
+    }
 
-    // Validar que el texto extraído sea real y no solo errores
-    // BLOQUEO: no generar plan sin material
-    if (!ev.archivos || ev.archivos.length === 0) {
-      return res.status(400).json({ error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el plan.' })
+    // BLOQUEO: no generar plan sin material (archivos O youtube)
+    if ((!ev.archivos || ev.archivos.length === 0) && youtubeUrlsArr.length === 0) {
+      return terminar('error', { error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el plan.' })
     }
     // BLOQUEO: límite de regeneraciones (solo si ya tiene plan)
     if (ev.plan_estudio) {
@@ -417,62 +708,105 @@ Genera 5 tareas basadas en el material subido si existe. prioridad debe ser "alt
       const planesUsados = planesRes.rows[0]?.planes_usados || 0
       const limiteResP = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
       const limiteGlobalP = limiteResP.rows.length ? parseInt(limiteResP.rows[0].valor) : 100
-      if (planesUsados >= limiteGlobalP) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'planes', usados: planesUsados, limite: limiteGlobalP })
+      if (planesUsados >= limiteGlobalP) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
     }
     const textoLimpio = textoArchivos.replace(/--- Archivo:.*\(no se pudo extraer texto\) ---/g, '').replace(/--- Archivo:.*\(formato no soportado\) ---/g, '').trim()
     if (textoArchivos && !textoLimpio) {
-      return res.status(400).json({ error: 'archivo_no_legible', mensaje: 'No pudimos leer tu archivo. Por favor sube un PDF o Word (.docx)' })
+      return terminar('error', { error: 'archivo_no_legible', mensaje: 'No pudimos leer tu archivo. Por favor sube un PDF o Word (.docx)' })
     }
 
     const promptFinal = textoArchivos 
       ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- NUNCA rechaces el material ni sugieras buscar otro. Usa lo que hay.`
       : promptText
 
-    try {
-      const result = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: promptFinal }],
-        temperature: 0.7
-      })
-      const text = result.choices[0].message.content
-      const jsonMatch = text.match(/\{[\s\S]*\}/)
-      if (!jsonMatch) throw new Error('No JSON')
-      const plan = JSON.parse(jsonMatch[0])
-      await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2 WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
-      if (ev.plan_estudio) {
-        await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [req.user.id])
-      }
-      // Guardar archivos en tabla archivos si no existen ya
-      if (ev.archivos && ev.archivos.length > 0) {
-        for (const archivo of ev.archivos) {
-          const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [evalId, archivo.nombre])
-          if (existe.length === 0) {
-            const buffer = Buffer.from(archivo.datos, 'base64')
-            await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [evalId, archivo.nombre, archivo.tipo, buffer])
+    // Marcar como generando en DB
+    await pool.query('UPDATE evaluaciones SET plan_generando = TRUE WHERE id = $1', [evalId])
+
+    const usuarioId = req.user.id
+    const nombreEval = ev.nombre || 'tu evaluación'
+
+    // Procesar en background — el usuario puede salir
+    setImmediate(async () => {
+      try {
+        enviar('progreso', { msg: '🧠 Analizando todo el material con IA...' })
+        const result = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: promptFinal }],
+          temperature: 0.7
+        })
+        const text = result.choices[0].message.content
+        const jsonMatch = text.match(/\{[\s\S]*\}/)
+        if (!jsonMatch) throw new Error('No JSON')
+        const plan = JSON.parse(jsonMatch[0])
+        enviar('progreso', { msg: '✅ Plan generado, guardando...' })
+        await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2, plan_generando = FALSE WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
+        if (ev.plan_estudio) {
+          await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [usuarioId])
+        }
+        // Guardar archivos en tabla archivos si no existen ya
+        if (ev.archivos && ev.archivos.length > 0) {
+          for (const archivo of ev.archivos) {
+            const { rows: existe } = await pool.query('SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2', [evalId, archivo.nombre])
+            if (existe.length === 0) {
+              const buffer = Buffer.from(archivo.datos, 'base64')
+              await pool.query('INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)', [evalId, archivo.nombre, archivo.tipo, buffer])
+            }
           }
         }
+        terminar('plan', { plan })
+        // Notificar al usuario
+        await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
+      } catch(geminiErr) {
+        console.error('GPT error:', geminiErr.message)
+        try {
+          enviar('progreso', { msg: '⚠️ Reintentando...' })
+          const fallback = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: promptFinal }],
+            temperature: 0.7
+          })
+          const text2 = fallback.choices[0].message.content
+          const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
+          if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
+          const plan2 = JSON.parse(jsonMatch2[0])
+          await pool.query('UPDATE evaluaciones SET plan_estudio = $1, plan_generando = FALSE WHERE id = $2', [JSON.stringify(plan2), evalId])
+          terminar('plan', { plan: plan2 })
+          await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
+        } catch(fallbackErr) {
+          console.error('Fallback error:', fallbackErr.message)
+          await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId])
+          terminar('error', { error: 'error_interno', mensaje: 'No se pudo generar el plan. Intenta de nuevo.' })
+        }
       }
-      return res.json(plan)
-    } catch(geminiErr) {
-      console.error('GPT error:', geminiErr.message)
-      // Fallback: reintentar
-      const fallback = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: promptFinal }],
-        temperature: 0.7
-      })
-      const text2 = fallback.choices[0].message.content
-      const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
-      if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
-      const plan2 = JSON.parse(jsonMatch2[0])
-      if (!textoArchivos) plan2._archivoNoProcessado = true
-      await pool.query('UPDATE evaluaciones SET plan_estudio = $1 WHERE id = $2', [JSON.stringify(plan2), evalId])
-      return res.json(plan2)
-    }
+    })
 
   } catch (err) {
     console.error('Error generando plan:', err)
-    res.status(500).json({ error: 'Error al generar plan de estudio' })
+    await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
+    try { terminar('error', { error: 'error_interno', mensaje: 'Error al generar plan de estudio' }) } catch(_) {}
+  }
+})
+
+
+// Consultar estado de generación del plan
+app.get('/evaluaciones/:id/plan-estado', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT e.plan_estudio, e.plan_generando FROM evaluaciones e
+        JOIN ramos r ON r.id = e.ramo_id
+        WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'No encontrada' })
+    const ev = rows[0]
+    res.json({
+      generando: ev.plan_generando || false,
+      listo: !!ev.plan_estudio && !ev.plan_generando,
+      plan: ev.plan_estudio ? JSON.parse(ev.plan_estudio) : null
+    })
+  } catch(e) {
+    console.error('❌ plan-estado error:', e.message, e.stack)
+    res.status(500).json({ error: e.message })
   }
 })
 
@@ -976,6 +1310,8 @@ app.post('/admin/notificacion-broadcast', authenticateToken, async (req, res) =>
 
 
 // Cuántos spots de fundador quedan
+
+
 app.get('/fundadores/spots', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
