@@ -808,7 +808,7 @@ app.get('/evaluaciones/:id/plan-estado', authenticateToken, async (req, res) => 
     res.json({
       generando: ev.plan_generando || false,
       listo: !!ev.plan_estudio && !ev.plan_generando,
-      plan: ev.plan_estudio ? JSON.parse(ev.plan_estudio) : null
+      plan: ev.plan_estudio ? (typeof ev.plan_estudio === "string" ? JSON.parse(ev.plan_estudio) : ev.plan_estudio) : null
     })
   } catch(e) {
     console.error('❌ plan-estado error:', e.message, e.stack)
@@ -1646,7 +1646,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       }, {
         role: 'user',
         content: material
-        ? 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 12000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener entre 28 y 35 segmentos, cada uno con 2-3 oraciones. Sé conciso pero claro.'
+        ? 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 15000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener entre 28 y 35 segmentos, cada uno con 2-3 oraciones. Sé conciso pero claro.'
         : 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Entre 28 y 35 segmentos, cada uno con 2-3 oraciones.'
       }],
       response_format: { type: 'json_object' }
@@ -1741,8 +1741,21 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
     }
 
     let contenidoArchivos = ''
-    if (ev.archivos && ev.archivos.length > 0) {
-      contenidoArchivos = `\nEl estudiante ha subido los siguientes archivos de estudio: ${ev.archivos.map(a => a.nombre).join(', ')}. Usa estos temas como contexto.`
+    if (ev.texto_material && ev.texto_material.trim()) {
+      contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${ev.texto_material.slice(0, 15000)}`
+    } else if (ev.archivos && ev.archivos.length > 0) {
+      let textoExtraido = ''
+      for (const archivo of ev.archivos) {
+        if (archivo.datos || archivo.youtubeUrl) {
+          try {
+            const contenido = await extraerContenido(archivo)
+            textoExtraido += `\n\n--- ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
+          } catch(e) { console.error('Error extrayendo para guía:', e.message) }
+        }
+      }
+      if (textoExtraido.trim()) {
+        contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${textoExtraido.slice(0, 15000)}`
+      }
     }
 
     const prompt = `Eres el mejor tutor universitario del mundo — un experto que combina la claridad de Richard Feynman, la pedagogía de un profesor que realmente se preocupa por sus estudiantes, y la capacidad de hacer que cualquier tema sea fascinante. Tu misión es generar una guía de estudio TAN BUENA que el estudiante diga "¡WOW, esto es espectacular!".
@@ -1866,33 +1879,52 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
-    // BLOQUEO: límite quizzes (solo nuevas generaciones, no cache)
+    // BLOQUEO: límite quizzes
     const quizzesRes = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
     const quizzesUsados = quizzesRes.rows[0]?.quizzes_usados || 0
     const limiteResQ = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limiteGlobalQ = limiteResQ.rows.length ? parseInt(limiteResQ.rows[0].valor) : 100
     if (quizzesUsados >= limiteGlobalQ) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados, limite: limiteGlobalQ })
-    // Usar texto ya extraído si existe
-    let textoArchivos = ev.texto_material || ''
-    if (!textoArchivos && (!ev.archivos || ev.archivos.length === 0)) {
+    if (!ev.texto_material && (!ev.archivos || ev.archivos.length === 0)) {
       return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
     }
-    if (!textoArchivos) for (const archivo of ev.archivos) {
-      if (archivo.datos) {
-        try {
-          const buffer = Buffer.from(archivo.datos, 'base64')
-          if (archivo.tipo && archivo.tipo.includes('pdf')) {
-            const parsed = { text: await extraerTextoPDF(buffer) }
-            textoArchivos += `\n\n--- ${archivo.nombre} ---\n${parsed.text.slice(0, 10000)}`
-          } else if (archivo.tipo && (archivo.tipo.includes('word') || archivo.tipo.includes('docx') || archivo.nombre?.endsWith('.docx'))) {
-            const result = await mammoth.extractRawText({ buffer })
-            textoArchivos += `\n\n--- ${archivo.nombre} ---\n${result.value.slice(0, 10000)}`
-          }
-        } catch(e) { console.error('Error extrayendo texto para quiz:', e.message) }
-      }
+
+    // ── SSE setup ──
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.flushHeaders()
+
+    const enviar = (tipo, datos) => {
+      res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
     }
-    if (!textoArchivos.trim()) return res.status(400).json({ error: 'No se pudo extraer texto del material subido' })
-    const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
+
+    enviar('progreso', { msg: '🧠 Iniciando generación del quiz...' })
+    enviar('iniciado', { msg: 'Tu quiz se está generando. Puedes cerrar esta pantalla y te avisaremos cuando esté listo.' })
+
+    const usuarioId = req.user.id
+    const evalId = req.params.id
+
+    setImmediate(async () => {
+      try {
+        let textoArchivos = ev.texto_material || ''
+        if (!textoArchivos) {
+          for (const archivo of ev.archivos) {
+            if (archivo.datos || archivo.youtubeUrl) {
+              try {
+                enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre || 'archivo'}...` })
+                const contenido = await extraerContenido(archivo, enviar)
+                textoArchivos += `\n\n--- ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
+              } catch(e) { console.error('Error extrayendo texto para quiz:', e.message) }
+            }
+          }
+        }
+        if (!textoArchivos.trim()) {
+          enviar('error', { error: 'sin_contenido', mensaje: 'No se pudo extraer texto del material subido' })
+          return res.end()
+        }
+        enviar('progreso', { msg: '🤖 Generando 20 preguntas con IA...' })
+        const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
 
 Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
@@ -1917,27 +1949,30 @@ INSTRUCCIONES CRÍTICAS:
 
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
-    const result = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7
+        const result = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.7
+        })
+        let text = result.choices[0].message.content
+        text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
+        const jsonMatch = text.match(/\{[\s\S]*\}/)
+        if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
+        let quizData
+        try { quizData = JSON.parse(jsonMatch[0]) }
+        catch (parseErr) { throw new Error('La IA devolvió JSON inválido') }
+        if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
+        enviar('progreso', { msg: '✅ Quiz generado, guardando...' })
+        await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
+        await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [usuarioId])
+        enviar('quiz', { preguntas: quizData.preguntas })
+        res.end()
+      } catch (err) {
+        console.error('Error generando quiz:', err)
+        enviar('error', { error: 'fallo_ia', mensaje: 'Error al generar quiz: ' + err.message })
+        res.end()
+      }
     })
-    let text = result.choices[0].message.content
-    // Limpiar markdown si viene envuelto en ```json ... ```
-    text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
-    const jsonMatch = text.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
-    let quizData
-    try {
-      quizData = JSON.parse(jsonMatch[0])
-    } catch (parseErr) {
-      console.error('JSON inválido:', jsonMatch[0].substring(0, 200))
-      throw new Error('La IA devolvió JSON inválido')
-    }
-    if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
-    await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), req.params.id])
-    await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [req.user.id])
-    res.json({ preguntas: quizData.preguntas })
   } catch (err) {
     console.error('Error generando quiz:', err)
     res.status(500).json({ error: 'Error al generar quiz: ' + err.message })
