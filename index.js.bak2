@@ -43,6 +43,139 @@ async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
   } catch(e) { console.error('notificarUsuario error:', e.message) }
 }
 
+// ══════════════════════════════════════════════════════════════
+// GAMIFICACIÓN — XP, NIVELES, RACHA Y LOGROS
+// ══════════════════════════════════════════════════════════════
+
+const NIVELES = [
+  { nivel: 1, nombre: 'Estudiante Nuevo',    xp_min: 0    },
+  { nivel: 2, nombre: 'Estudiante Regular',  xp_min: 200  },
+  { nivel: 3, nombre: 'Estudiante Dedicado', xp_min: 500  },
+  { nivel: 4, nombre: 'Estudiante Pro',      xp_min: 1000 },
+  { nivel: 5, nombre: 'Estudiante Élite',    xp_min: 2000 },
+  { nivel: 6, nombre: 'Maestro del Estudio', xp_min: 4000 },
+  { nivel: 7, nombre: 'Leyenda UFRO',        xp_min: 8000 },
+]
+
+function calcularNivel(xp) {
+  let nivel = NIVELES[0]
+  for (const n of NIVELES) { if (xp >= n.xp_min) nivel = n }
+  return nivel
+}
+
+async function obtenerOCrearXP(usuarioId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM xp_usuarios WHERE usuario_id = $1', [usuarioId]
+  )
+  if (rows.length > 0) return rows[0]
+  const { rows: nuevo } = await pool.query(
+    'INSERT INTO xp_usuarios (usuario_id, xp_total, nivel, racha_dias, ultima_actividad) VALUES ($1, 0, 1, 0, CURRENT_DATE) RETURNING *',
+    [usuarioId]
+  )
+  return nuevo[0]
+}
+
+async function otorgarXP(usuarioId, cantidad, motivo = '') {
+  try {
+    const xpActual = await obtenerOCrearXP(usuarioId)
+    const hoy = new Date().toISOString().split('T')[0]
+    const ultimaActividad = xpActual.ultima_actividad ? xpActual.ultima_actividad.toISOString().split('T')[0] : null
+    
+    // Calcular racha
+    let nuevaRacha = xpActual.racha_dias || 0
+    if (ultimaActividad !== hoy) {
+      const ayer = new Date(); ayer.setDate(ayer.getDate() - 1)
+      const ayerStr = ayer.toISOString().split('T')[0]
+      if (ultimaActividad === ayerStr) {
+        nuevaRacha += 1
+      } else if (ultimaActividad !== hoy) {
+        nuevaRacha = 1
+      }
+    }
+
+    const nuevoXP = (xpActual.xp_total || 0) + cantidad
+    const nivelInfo = calcularNivel(nuevoXP)
+
+    await pool.query(
+      `UPDATE xp_usuarios SET xp_total = $1, nivel = $2, racha_dias = $3, ultima_actividad = CURRENT_DATE WHERE usuario_id = $4`,
+      [nuevoXP, nivelInfo.nivel, nuevaRacha, usuarioId]
+    )
+
+    // Actualizar contador en usuarios según motivo
+    const contadores = {
+      'plan_generado':    'planes_usados',
+      'quiz_generado':    'quizzes_usados',
+      'podcast_generado': 'podcasts_usados',
+      'ejercicio_generado': 'ejercicios_usados',
+    }
+    if (contadores[motivo]) {
+      await pool.query(
+        `UPDATE usuarios SET ${contadores[motivo]} = COALESCE(${contadores[motivo]}, 0) + 1 WHERE id = $1`,
+        [usuarioId]
+      )
+    }
+
+    console.log(`⚡ XP +${cantidad} (${motivo}) → usuario ${usuarioId} | Total: ${nuevoXP} | Nivel: ${nivelInfo.nivel} | Racha: ${nuevaRacha}`)
+
+    // Verificar logros desbloqueables
+    const logrosNuevos = await verificarLogros(usuarioId, nuevoXP, nuevaRacha)
+    return { xp_total: nuevoXP, nivel: nivelInfo, racha_dias: nuevaRacha, logros_nuevos: logrosNuevos }
+  } catch(e) {
+    console.error('otorgarXP error:', e.message)
+    return null
+  }
+}
+
+async function verificarLogros(usuarioId, xpTotal, rachaDias) {
+  try {
+    const { rows: usuario } = await pool.query(
+      'SELECT planes_usados, quizzes_usados, podcasts_usados, ejercicios_usados, es_fundador FROM usuarios WHERE id = $1',
+      [usuarioId]
+    )
+    if (!usuario.length) return []
+    const u = usuario[0]
+
+    const { rows: yaDesbloqueados } = await pool.query(
+      'SELECT logro_id FROM logros_usuarios WHERE usuario_id = $1', [usuarioId]
+    )
+    const idsDesbloqueados = new Set(yaDesbloqueados.map(r => r.logro_id))
+
+    const { rows: todosLogros } = await pool.query('SELECT * FROM logros')
+    const nuevosLogros = []
+
+    for (const logro of todosLogros) {
+      if (idsDesbloqueados.has(logro.id)) continue
+      let cumple = false
+      switch(logro.condicion_tipo) {
+        case 'planes_usados':    cumple = (u.planes_usados    || 0) >= logro.condicion_valor; break
+        case 'quizzes_usados':   cumple = (u.quizzes_usados   || 0) >= logro.condicion_valor; break
+        case 'podcasts_usados':  cumple = (u.podcasts_usados  || 0) >= logro.condicion_valor; break
+        case 'ejercicios_usados':cumple = (u.ejercicios_usados|| 0) >= logro.condicion_valor; break
+        case 'racha_dias':       cumple = rachaDias >= logro.condicion_valor; break
+        case 'es_fundador':      cumple = u.es_fundador === true; break
+      }
+      if (cumple) {
+        await pool.query(
+          'INSERT INTO logros_usuarios (usuario_id, logro_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [usuarioId, logro.id]
+        )
+        // Otorgar XP de recompensa del logro (sin recursión)
+        await pool.query(
+          'UPDATE xp_usuarios SET xp_total = xp_total + $1 WHERE usuario_id = $2',
+          [logro.xp_recompensa, usuarioId]
+        )
+        nuevosLogros.push(logro)
+        console.log(`🏆 Logro desbloqueado: ${logro.titulo} → usuario ${usuarioId}`)
+      }
+    }
+    return nuevosLogros
+  } catch(e) {
+    console.error('verificarLogros error:', e.message)
+    return []
+  }
+}
+
+
 
 
 // ══════════════════════════════════════════════════════════════
