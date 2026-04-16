@@ -710,12 +710,19 @@ Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin 
 {
   "resumen": "descripción breve del plan en 1-2 oraciones",
   "tareas": [
-    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "alta", "duracion": 45, "fecha": "Lunes 10:00-11:30" },
-    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "media", "duracion": 30, "fecha": "Martes 14:00-14:30" }
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "alta", "duracion": 45, "fecha": "Lunes 10:00-11:30", "fuente": "nombre del archivo o 'Video min 12:30-15:00'" },
+    { "titulo": "título corto", "descripcion": "descripción detallada", "prioridad": "media", "duracion": 30, "fecha": "Martes 14:00-14:30", "fuente": "nombre del archivo o 'Video min 05:00-08:00'" }
   ]
 }
 
-Genera entre 5 y 10 tareas según la cantidad de contenido del material. Si el material tiene múltiples temas, DEBES cubrir TODOS los temas con al menos una tarea cada uno — no omitas ningún tema del material. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha DEBE ser el día y hora sugerida para estudiar esa tarea, en formato "Lunes 10:00-11:30", usando SOLO los bloques libres del horario.`
+Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del material — sin límite fijo:
+- Material corto (1-2 temas): mínimo 3 tareas.
+- Material mediano (3-6 temas): entre 6 y 10 tareas.
+- Material extenso (7+ temas o múltiples archivos): entre 10 y 20 tareas.
+- NUNCA omitas un tema. Cada tema o subtema importante debe tener al menos una tarea.
+- NO repitas tareas genéricas. Cada tarea debe ser específica al contenido real del material.
+- prioridad: "alta", "media" o "baja". duracion en minutos (número). fecha en formato "Lunes 10:00-11:30" usando SOLO bloques libres del horario.
+- fuente: indica de dónde proviene el contenido. Si es archivo, escribe el nombre exacto (ej: "CURRALHUE PARTE 1.pptx"). Si es YouTube, escribe el rango de minutos (ej: "Video min 12:30-15:00"). Si son múltiples fuentes, sepáralas con coma.`
 
     // Extraer texto de los archivos
     let textoArchivos = ''
@@ -746,13 +753,23 @@ Genera entre 5 y 10 tareas según la cantidad de contenido del material. Si el m
     // Procesar TODOS los archivos (PDF, DOCX, YouTube, etc.)
     for (const archivo of archivosActualizados) {
       const esYoutube = archivo.tipo === 'youtube'
+      // Nombre legible para YouTube
+      const nombreLegible = esYoutube
+        ? (() => { try { const u = new URL(archivo.nombre); const v = u.searchParams.get('v'); return v ? `YouTube:${v}` : 'Video YouTube' } catch(e) { return 'Video YouTube' } })()
+        : archivo.nombre
       const archivoObj = esYoutube
-        ? { youtubeUrl: archivo.nombre, nombre: 'Video YouTube' }
+        ? { youtubeUrl: archivo.nombre, nombre: nombreLegible }
         : { nombre: archivo.nombre, tipo: archivo.tipo, datos: archivo.datos }
-      enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre}...` })
-      console.log('📎 Procesando:', archivo.nombre, '| tipo:', archivo.tipo)
+      enviar('progreso', { msg: `📄 Leyendo: ${nombreLegible}...` })
+      console.log('📎 Procesando:', nombreLegible, '| tipo:', archivo.tipo)
       const contenido = await extraerContenido(archivoObj, enviar)
-      textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${contenido}`
+      // Si es YouTube, intentar extraer título real del contenido
+      let nombreFuente = nombreLegible
+      if (esYoutube && contenido.startsWith('Título:')) {
+        const tituloMatch = contenido.match(/^Título: (.+)/m)
+        if (tituloMatch) nombreFuente = tituloMatch[1].trim().slice(0, 60)
+      }
+      textoArchivos += `\n\n--- Contenido de ${nombreFuente} ---\n${contenido}`
     }
 
     // BLOQUEO: no generar plan sin material (archivos O youtube)
