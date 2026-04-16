@@ -2017,7 +2017,8 @@ INSTRUCCIONES CRÍTICAS:
 - Responde SOLO JSON válido sin markdown
 
 Formato:
-{"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"A","explicacion":"...","dificultad":"facil"}]}`
+{"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"C","explicacion":"...","dificultad":"facil"},{"id":2,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"B","explicacion":"...","dificultad":"media"}]}
+IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C y D. NO pongas siempre A como correcta.`
         const result = await openai.chat.completions.create({
           model: 'gpt-4o',
           messages: [{ role: 'user', content: prompt }],
@@ -2028,9 +2029,27 @@ Formato:
         const jsonMatch = text.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
         let quizData
-        try { quizData = JSON.parse(jsonMatch[0]) }
+        try { quizData = JSON.parse(jsonMatch[0]); console.log('🔍 CORRECTAS:', quizData.preguntas.slice(0,5).map(p => p.correcta)) }
         catch (parseErr) { throw new Error('La IA devolvió JSON inválido') }
         if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
+        // Shufflear alternativas para que la correcta no siempre quede en A
+        const letras = ['A','B','C','D']
+        quizData.preguntas = quizData.preguntas.map(p => {
+          const entries = Object.entries(p.alternativas) // [['A','texto'],...]
+          const correctaTexto = p.alternativas[p.correcta]
+          // Fisher-Yates shuffle
+          for (let i = entries.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [entries[i], entries[j]] = [entries[j], entries[i]]
+          }
+          const nuevasAlternativas = {}
+          let nuevaCorrecta = p.correcta
+          entries.forEach(([, texto], idx) => {
+            nuevasAlternativas[letras[idx]] = texto
+            if (texto === correctaTexto) nuevaCorrecta = letras[idx]
+          })
+          return { ...p, alternativas: nuevasAlternativas, correcta: nuevaCorrecta }
+        })
         enviar('progreso', { msg: '✅ Quiz generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
         await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [usuarioId])
