@@ -154,7 +154,8 @@ async function extraerContenido(archivo, enviar = () => {}) {
   // ── PDF ──
   if (tipo?.includes('pdf') || ext === 'pdf') {
     try {
-      const texto = await extraerTextoPDF(buffer)?.trim()
+      const textoRaw = await extraerTextoPDF(buffer)
+      const texto = textoRaw?.trim()
       if (texto && texto.length > 100) {
         console.log(`📄 PDF texto extraído: ${texto.slice(0,200)}`)
         return texto.slice(0, 15000)
@@ -681,29 +682,42 @@ Responde SOLO con un JSON válido con esta estructura exacta (sin markdown, sin 
 
 Genera entre 5 y 10 tareas según la cantidad de contenido del material. Si el material tiene múltiples temas, DEBES cubrir TODOS los temas con al menos una tarea cada uno — no omitas ningún tema del material. prioridad debe ser "alta", "media" o "baja". duracion en minutos (número). fecha DEBE ser el día y hora sugerida para estudiar esa tarea, en formato "Lunes 10:00-11:30", usando SOLO los bloques libres del horario.`
 
-    // Extraer texto de los archivos`
+    // Extraer texto de los archivos
     let textoArchivos = ''
-    console.log('📎 Archivos encontrados:', ev.archivos ? ev.archivos.length : 0)
-    // Procesar archivos guardados
-    if (ev.archivos && ev.archivos.length > 0) {
-      for (const archivo of ev.archivos) {
-        if (archivo.datos || archivo.youtubeUrl) {
-          enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre || 'archivo'}...` })
-          const contenido = await extraerContenido(archivo)
-          textoArchivos += `\n\n--- Contenido de ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
-        }
-      }
-    }
-    // Procesar YouTube URLs enviadas en el request (puede ser string o array)
+    console.log('📎 Archivos en BD:', ev.archivos ? ev.archivos.length : 0)
+    // Procesar YouTube URLs enviadas en el request — guardarlas en BD para persistencia
     const youtubeUrlRaw = req.body.youtubeUrl || req.query.youtubeUrl
     const youtubeUrlsArr = youtubeUrlRaw ? (Array.isArray(youtubeUrlRaw) ? youtubeUrlRaw : [youtubeUrlRaw]) : []
     for (const yUrl of youtubeUrlsArr) {
       if (yUrl && typeof yUrl === 'string' && yUrl.trim()) {
-        console.log('🎬 Procesando YouTube:', yUrl)
-        enviar('progreso', { msg: `🎬 Descargando audio del video de YouTube...` })
-        const contenido = await extraerContenido({ youtubeUrl: yUrl.trim(), nombre: 'Video YouTube' }, enviar)
-        textoArchivos += `\n\n--- Contenido de Video YouTube ---\n${contenido}`
+        // Guardar en BD como archivo tipo youtube si no existe
+        const { rows: ytExiste } = await pool.query(
+          'SELECT id FROM archivos WHERE evaluacion_id = $1 AND nombre = $2',
+          [evalId, yUrl.trim()]
+        )
+        if (ytExiste.length === 0) {
+          await pool.query(
+            'INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4)',
+            [evalId, yUrl.trim(), 'youtube', Buffer.from(yUrl.trim())]
+          )
+        }
       }
+    }
+    // Recargar archivos desde BD (ahora incluye YouTube recién guardados)
+    const { rows: archivosActualizados } = await pool.query(
+      `SELECT nombre, tipo, encode(datos, 'base64') as datos FROM archivos WHERE evaluacion_id = $1`,
+      [evalId]
+    )
+    // Procesar TODOS los archivos (PDF, DOCX, YouTube, etc.)
+    for (const archivo of archivosActualizados) {
+      const esYoutube = archivo.tipo === 'youtube'
+      const archivoObj = esYoutube
+        ? { youtubeUrl: archivo.nombre, nombre: 'Video YouTube' }
+        : { nombre: archivo.nombre, tipo: archivo.tipo, datos: archivo.datos }
+      enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre}...` })
+      console.log('📎 Procesando:', archivo.nombre, '| tipo:', archivo.tipo)
+      const contenido = await extraerContenido(archivoObj, enviar)
+      textoArchivos += `\n\n--- Contenido de ${archivo.nombre} ---\n${contenido}`
     }
 
     // BLOQUEO: no generar plan sin material (archivos O youtube)
