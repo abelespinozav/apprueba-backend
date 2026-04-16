@@ -354,6 +354,17 @@ async function initDB() {
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS quiz_generado JSONB;
+    ALTER TABLE quiz_historial ADD COLUMN IF NOT EXISTS evaluacion_id INTEGER;
+    CREATE TABLE IF NOT EXISTS quiz_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      evaluacion_id INTEGER REFERENCES evaluaciones(id) ON DELETE CASCADE,
+      ramo_nombre TEXT,
+      puntaje INTEGER,
+      total INTEGER,
+      porcentaje INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_usados INTEGER DEFAULT 0;
@@ -1899,6 +1910,30 @@ app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, 
 // Mon Apr  6 14:31:43 -04 2026
 
 // ── QUIZ DE 20 PREGUNTAS ─────────────────────────────────────────
+// Guardar resultado quiz
+app.post('/quiz/historial', authenticateToken, async (req, res) => {
+  try {
+    const { evaluacion_id, ramo_id, ramo_nombre, puntaje, total } = req.body
+    const porcentaje = Math.round((puntaje / total) * 100)
+    await pool.query(
+      'INSERT INTO quiz_historial (usuario_id, evaluacion_id, ramo_nombre, puntaje, total, porcentaje) VALUES ($1,$2,$3,$4,$5,$6)',
+      [req.user.id, evaluacion_id || ramo_id || null, ramo_nombre, puntaje, total, porcentaje]
+    )
+    res.json({ ok: true })
+  } catch(e) { console.error('❌ Error POST /quiz/historial:', e.message); res.status(500).json({ error: e.message }) }
+})
+
+// Historial de quizzes del usuario
+app.get('/quiz/historial', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM quiz_historial WHERE usuario_id=$1 ORDER BY created_at DESC LIMIT 50',
+      [req.user.id]
+    )
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
   try {
     const { forzar } = req.body
