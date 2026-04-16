@@ -606,7 +606,18 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
 
 // Eliminar archivo
 app.delete('/archivos/:id', authenticateToken, async (req, res) => {
+  // Obtener evaluacion_id antes de eliminar
+  const { rows } = await pool.query('SELECT evaluacion_id FROM archivos WHERE id = $1', [req.params.id])
   await pool.query('DELETE FROM archivos WHERE id = $1', [req.params.id])
+  // Invalidar texto_material y guias_tareas para que se regeneren con material actualizado
+  if (rows[0]?.evaluacion_id) {
+    const evalId = rows[0].evaluacion_id
+    // Siempre resetear plan al eliminar cualquier archivo
+    await pool.query(
+      'UPDATE evaluaciones SET texto_material = NULL, guias_tareas = NULL, plan_estudio = NULL WHERE id = $1',
+      [evalId]
+    )
+  }
   res.json({ ok: true })
 })
 
@@ -1757,21 +1768,28 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
     }
 
     let contenidoArchivos = ''
-    if (ev.texto_material && ev.texto_material.trim()) {
-      contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${ev.texto_material.slice(0, 15000)}`
-    } else if (ev.archivos && ev.archivos.length > 0) {
+    // Siempre re-extraer desde archivos en BD para tener contenido actualizado
+    const { rows: archivosGuia } = await pool.query(
+      `SELECT nombre, tipo, encode(datos, 'base64') as datos FROM archivos WHERE evaluacion_id = $1`,
+      [req.params.id]
+    )
+    if (archivosGuia.length > 0) {
       let textoExtraido = ''
-      for (const archivo of ev.archivos) {
-        if (archivo.datos || archivo.youtubeUrl) {
-          try {
-            const contenido = await extraerContenido(archivo)
-            textoExtraido += `\n\n--- ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
-          } catch(e) { console.error('Error extrayendo para guía:', e.message) }
-        }
+      for (const archivo of archivosGuia) {
+        try {
+          const esYoutube = archivo.tipo === 'youtube'
+          const archivoObj = esYoutube
+            ? { youtubeUrl: archivo.nombre, nombre: 'Video YouTube' }
+            : { nombre: archivo.nombre, tipo: archivo.tipo, datos: archivo.datos }
+          const contenido = await extraerContenido(archivoObj)
+          textoExtraido += `\n\n--- ${archivo.nombre} ---\n${contenido}`
+        } catch(e) { console.error('Error extrayendo para guía:', e.message) }
       }
       if (textoExtraido.trim()) {
         contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${textoExtraido.slice(0, 15000)}`
       }
+    } else if (ev.texto_material && ev.texto_material.trim()) {
+      contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${ev.texto_material.slice(0, 15000)}`
     }
 
     const prompt = `Eres el mejor tutor universitario del mundo — un experto que combina la claridad de Richard Feynman, la pedagogía de un profesor que realmente se preocupa por sus estudiantes, y la capacidad de hacer que cualquier tema sea fascinante. Tu misión es generar una guía de estudio TAN BUENA que el estudiante diga "¡WOW, esto es espectacular!".
