@@ -314,6 +314,8 @@ app.set('trust proxy', 1)
 app.use(cors({
   origin: [
     'http://localhost:5173',
+    'http://192.168.0.48:5173',
+    'http://192.168.0.48:3001',
     'https://apprueba-production.up.railway.app',
     process.env.CLIENT_URL
   ].filter(Boolean),
@@ -2026,24 +2028,24 @@ Responde SOLO con JSON válido:
     await pool.query('UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1', [req.user.id])
     doc.pipe(res)
 
-    // ── Helpers ──────────────────────────────────────────────────
-    const BG       = '#0f0f1a'
-    const CARD     = '#1a1a2e'
+    // ── Colores (fondo blanco) ────────────────────────────────────
     const ACCENT   = '#6c63ff'
-    const ACCENT2  = '#a78bfa'
-    const WHITE    = '#ffffff'
-    const GRAY     = '#a0a0b8'
-    const EASY     = '#34d399'
-    const MED      = '#fbbf24'
-    const HARD     = '#f87171'
-    const W        = 595 - 100  // page width minus margins
+    const ACCENT2  = '#4f46e5'
+    const BLACK    = '#1a1a2e'
+    const DARK     = '#374151'
+    const MID      = '#6b7280'
+    const LIGHT    = '#f3f4f6'
+    const EASY_C   = '#059669'
+    const MED_C    = '#d97706'
+    const HARD_C   = '#dc2626'
+    const W        = 595 - 100
     const PAGE_H   = 842
 
     const diffColor = (d) => {
       const dl = (d || '').toLowerCase()
-      if (dl.includes('f')) return EASY
-      if (dl.includes('m')) return MED
-      return HARD
+      if (dl.includes('f')) return EASY_C
+      if (dl.includes('m')) return MED_C
+      return HARD_C
     }
     const diffLabel = (d) => {
       const dl = (d || '').toLowerCase()
@@ -2052,138 +2054,176 @@ Responde SOLO con JSON válido:
       return 'DIFÍCIL'
     }
 
-    const drawPageBg = () => {
-      doc.rect(0, 0, 595, PAGE_H).fill(BG)
-    }
+    // ── PORTADA (todo con coordenadas absolutas para no mover cursor) ──
+    doc.rect(0, 0, 595, PAGE_H).fill('#ffffff')
+    doc.rect(0, 0, 595, 80).fill(ACCENT)
 
-    // ── PORTADA ──────────────────────────────────────────────────
-    drawPageBg()
+    // Logo
+    doc.fontSize(18).fillColor('#ffffff').font('Helvetica-Bold')
+       .text('APPrueba', 50, 28, { width: 200, lineBreak: false })
 
-    // Header bar
-    doc.rect(0, 0, 595, 8).fill(ACCENT)
+    // Calcular alturas dinámicas para título y subtítulos
+    const titleH   = doc.heightOfString('Guía de Ejercicios', { fontSize: 26, width: W })
+    const subtitleH = doc.heightOfString(tarea.titulo, { fontSize: 15, width: W })
+    const ramH     = doc.heightOfString(ev.ramo_nombre + '  ·  ' + ev.nombre, { fontSize: 11, width: W })
 
-    // Logo pill
-    doc.roundedRect(50, 40, 120, 32, 8).fill(ACCENT)
-    doc.fontSize(15).fillColor(WHITE).font('Helvetica-Bold').text('APPrueba', 50, 49, { width: 120, align: 'center' })
+    let py = 110
+    doc.fontSize(26).fillColor(BLACK).font('Helvetica-Bold')
+       .text('Guía de Ejercicios', 50, py, { width: W, lineBreak: false })
+    py += titleH + 8
+    doc.fontSize(15).fillColor(ACCENT2).font('Helvetica-Bold')
+       .text(tarea.titulo, 50, py, { width: W, lineBreak: false })
+    py += subtitleH + 8
+    doc.fontSize(11).fillColor(MID).font('Helvetica')
+       .text(ev.ramo_nombre + '  ·  ' + ev.nombre, 50, py, { width: W, lineBreak: false })
+    py += ramH + 16
 
-    // Título principal
-    doc.fontSize(28).fillColor(WHITE).font('Helvetica-Bold').text('Guía de Ejercicios', 50, 110, { width: W })
-    doc.moveDown(0.4)
-    doc.fontSize(16).fillColor(ACCENT2).font('Helvetica').text(tarea.titulo, 50, doc.y, { width: W })
-    doc.moveDown(0.6)
-    doc.fontSize(12).fillColor(GRAY).text(ev.ramo_nombre + '  ·  ' + ev.nombre, 50, doc.y, { width: W })
-
-    // Divider
-    doc.moveDown(1.2)
-    doc.rect(50, doc.y, W, 2).fill(ACCENT)
-    doc.moveDown(1.5)
+    // Línea divisora
+    doc.rect(50, py, W, 2).fill(ACCENT)
+    py += 20
 
     // Stats cards
-    const cardY = doc.y
     const cardW = (W - 20) / 3
+    const cardY = py
     const stats = [
       { label: 'Ejercicios', value: '20', color: ACCENT },
       { label: 'Dificultades', value: '3 niveles', color: ACCENT2 },
-      { label: 'Respuestas', value: 'Al final', color: EASY }
+      { label: 'Respuestas', value: 'Al final', color: EASY_C }
     ]
     stats.forEach((s, i) => {
       const cx = 50 + i * (cardW + 10)
-      doc.roundedRect(cx, cardY, cardW, 60, 8).fill(CARD)
-      doc.fontSize(20).fillColor(s.color).font('Helvetica-Bold').text(s.value, cx, cardY + 10, { width: cardW, align: 'center' })
-      doc.fontSize(9).fillColor(GRAY).font('Helvetica').text(s.label, cx, cardY + 36, { width: cardW, align: 'center' })
+      doc.roundedRect(cx, cardY, cardW, 60, 6).fill(LIGHT)
+      doc.fontSize(20).fillColor(s.color).font('Helvetica-Bold')
+         .text(s.value, cx, cardY + 10, { width: cardW, align: 'center', lineBreak: false })
+      doc.fontSize(9).fillColor(MID).font('Helvetica')
+         .text(s.label, cx, cardY + 36, { width: cardW, align: 'center', lineBreak: false })
     })
-
-    doc.moveDown(5)
 
     // Leyenda dificultad
     const legY = cardY + 80
-    doc.fontSize(10).fillColor(GRAY).font('Helvetica').text('Niveles de dificultad:', 50, legY)
-    const levels = [{ label: 'Fácil  (1–7)', color: EASY }, { label: 'Medio  (8–14)', color: MED }, { label: 'Difícil  (15–20)', color: HARD }]
+    doc.fontSize(10).fillColor(DARK).font('Helvetica-Bold')
+       .text('Niveles de dificultad:', 50, legY, { lineBreak: false })
+    const levels = [
+      { label: 'Fácil  (1–7)', color: EASY_C },
+      { label: 'Medio  (8–14)', color: MED_C },
+      { label: 'Difícil  (15–20)', color: HARD_C }
+    ]
     levels.forEach((l, i) => {
       const lx = 50 + i * 160
       doc.circle(lx + 6, legY + 22, 5).fill(l.color)
-      doc.fontSize(10).fillColor(WHITE).text(l.label, lx + 16, legY + 16)
+      doc.fontSize(10).fillColor(DARK).font('Helvetica')
+         .text(l.label, lx + 16, legY + 16, { lineBreak: false })
     })
 
     // Footer portada
-    doc.fontSize(9).fillColor(GRAY).text('Generado por APPrueba · apprueba.cl', 50, PAGE_H - 40, { width: W, align: 'center' })
+    doc.fontSize(9).fillColor(MID)
+       .text('Generado por APPrueba · apprueba.cl', 50, PAGE_H - 40, { width: W, align: 'center', lineBreak: false })
 
     // ── EJERCICIOS ───────────────────────────────────────────────
-    ejercicios.forEach((ej, idx) => {
-      doc.addPage()
-      drawPageBg()
-      doc.rect(0, 0, 595, 8).fill(diffColor(ej.dificultad))
+    const LINES    = 4
+    const LINE_GAP = 18
+    const PAGE_BOTTOM = PAGE_H - 40
+
+    const ejHeight = (ej) => {
+      const h = doc.heightOfString(ej.enunciado, { width: W, fontSize: 11, lineGap: 3 })
+      return 24 + h + 8 + 14 + LINE_GAP * LINES + 20
+    }
+
+    // Primera página de ejercicios
+    doc.addPage()
+    doc.rect(0, 0, 595, PAGE_H).fill('#ffffff')
+    doc.rect(0, 0, 595, 6).fill(ACCENT)
+    let curY = 30
+    let misPageCount = 2 // portada + esta página
+
+    ejercicios.forEach((ej) => {
+      // Si no cabe en esta página, crear nueva
+      if (curY + ejHeight(ej) > PAGE_BOTTOM) {
+        doc.addPage()
+        doc.rect(0, 0, 595, PAGE_H).fill('#ffffff')
+        doc.rect(0, 0, 595, 6).fill(ACCENT)
+        curY = 30
+        misPageCount++
+      }
 
       const dc = diffColor(ej.dificultad)
       const dl = diffLabel(ej.dificultad)
 
-      // Número grande de fondo
-      doc.fontSize(90).fillColor('#ffffff08').font('Helvetica-Bold').text(String(ej.numero), 400, 20, { width: 160, align: 'right' })
-
       // Badge dificultad
-      doc.roundedRect(50, 20, 70, 22, 6).fill(dc)
-      doc.fontSize(9).fillColor(BG).font('Helvetica-Bold').text(dl, 50, 26, { width: 70, align: 'center' })
+      doc.roundedRect(50, curY, 56, 18, 4).fill(dc)
+      doc.fontSize(8).fillColor('#ffffff').font('Helvetica-Bold')
+         .text(dl, 50, curY + 5, { width: 56, align: 'center' })
 
       // Número ejercicio
-      doc.fontSize(13).fillColor(GRAY).font('Helvetica').text('Ejercicio', 130, 20)
-      doc.fontSize(22).fillColor(WHITE).font('Helvetica-Bold').text(String(ej.numero), 130, 34)
+      doc.fontSize(11).fillColor(BLACK).font('Helvetica-Bold')
+         .text(`Ejercicio ${ej.numero}`, 116, curY + 4)
 
-      // Línea separadora
-      doc.rect(50, 58, W, 1).fill(ACCENT)
+      curY += 24
 
       // Enunciado
-      doc.moveDown(0.5)
-      doc.fontSize(11).fillColor(ACCENT2).font('Helvetica-Bold').text('Enunciado', 50, 72)
-      doc.moveDown(0.3)
-      doc.fontSize(11).fillColor(WHITE).font('Helvetica').text(ej.enunciado, 50, doc.y, { width: W, lineGap: 4 })
+      const enunciadoH = doc.heightOfString(ej.enunciado, { width: W, fontSize: 11, lineGap: 3 })
+      doc.fontSize(11).fillColor(DARK).font('Helvetica')
+         .text(ej.enunciado, 50, curY, { width: W, lineGap: 3 })
+      curY += enunciadoH + 8
 
-      // Espacio para respuesta del alumno
-      doc.moveDown(1.5)
-      doc.fontSize(10).fillColor(GRAY).font('Helvetica-Bold').text('Tu respuesta:', 50, doc.y)
-      doc.moveDown(0.4)
-      // Líneas para escribir
-      const lineStartY = doc.y
-      for (let l = 0; l < 5; l++) {
-        const ly = lineStartY + l * 22
-        if (ly < PAGE_H - 60) {
-          doc.rect(50, ly, W, 1).fill('#2a2a4a')
-        }
+      // "Tu respuesta:"
+      doc.fontSize(9).fillColor(MID).font('Helvetica')
+         .text('Tu respuesta:', 50, curY)
+      curY += 14
+
+      // Líneas de respuesta
+      for (let l = 0; l < LINES; l++) {
+        doc.rect(50, curY + l * LINE_GAP, W, 0.8).fill('#d1d5db')
       }
-      doc.y = lineStartY + 5 * 22
+      curY += LINES * LINE_GAP + 8
 
-      // Footer
-      doc.fontSize(8).fillColor(GRAY).text(`${ev.ramo_nombre}  ·  APPrueba`, 50, PAGE_H - 30, { width: W, align: 'center' })
+      // Separador
+      doc.rect(50, curY, W, 0.5).fill('#e5e7eb')
+      curY += 12
     })
 
     // ── HOJA DE RESPUESTAS ───────────────────────────────────────
     doc.addPage()
-    drawPageBg()
-    doc.rect(0, 0, 595, 8).fill(ACCENT)
+    doc.rect(0, 0, 595, PAGE_H).fill('#ffffff')
+    doc.rect(0, 0, 595, 6).fill(ACCENT)
+    misPageCount++
 
-    doc.fontSize(22).fillColor(WHITE).font('Helvetica-Bold').text('Respuestas', 50, 30, { width: W })
-    doc.fontSize(11).fillColor(GRAY).font('Helvetica').text('Revisa tus respuestas solo después de completar todos los ejercicios', 50, 58, { width: W })
+    doc.fontSize(22).fillColor(BLACK).font('Helvetica-Bold').text('Respuestas', 50, 30, { width: W, lineBreak: false })
+    doc.fontSize(11).fillColor(MID).font('Helvetica').text('Revisa tus respuestas solo después de completar todos los ejercicios', 50, 58, { width: W, lineBreak: false })
     doc.rect(50, 78, W, 2).fill(ACCENT)
 
     let ry = 95
     ejercicios.forEach((ej) => {
-      if (ry > PAGE_H - 120) {
+      const solOpts = { width: W - 36, lineGap: 3, lineBreak: false }
+      const solH = doc.heightOfString(ej.solucion, { width: W - 36, lineGap: 3 })
+      const blockH = 18 + 14 + solH + 28
+
+      if (ry + blockH > PAGE_H - 40) {
         doc.addPage()
-        drawPageBg()
-        doc.rect(0, 0, 595, 8).fill(ACCENT)
+        doc.rect(0, 0, 595, PAGE_H).fill('#ffffff')
+        doc.rect(0, 0, 595, 6).fill(ACCENT)
         ry = 30
+        misPageCount++
       }
       const dc = diffColor(ej.dificultad)
-      // Número + badge
-      doc.roundedRect(50, ry, 28, 18, 4).fill(dc)
-      doc.fontSize(9).fillColor(BG).font('Helvetica-Bold').text(String(ej.numero), 50, ry + 4, { width: 28, align: 'center' })
-      // Solución
-      doc.fontSize(10).fillColor(WHITE).font('Helvetica-Bold').text('Ejercicio ' + ej.numero, 88, ry, { continued: false })
-      doc.fontSize(10).fillColor(GRAY).font('Helvetica').text(ej.solucion, 88, ry + 14, { width: W - 38, lineGap: 3 })
-      const textH = doc.heightOfString(ej.solucion, { width: W - 38 })
-      ry += textH + 30
-      // Divider
-      doc.rect(88, ry - 10, W - 38, 1).fill('#2a2a4a')
+      doc.roundedRect(50, ry, 26, 18, 4).fill(dc)
+      doc.fontSize(9).fillColor('#ffffff').font('Helvetica-Bold')
+         .text(String(ej.numero), 50, ry + 4, { width: 26, align: 'center', lineBreak: false })
+      doc.fontSize(10).fillColor(BLACK).font('Helvetica-Bold')
+         .text('Ejercicio ' + ej.numero, 86, ry + 4, { lineBreak: false })
+      doc.fontSize(10).fillColor(DARK).font('Helvetica')
+         .text(ej.solucion, 86, ry + 18, solOpts)
+      ry = ry + 18 + solH + 12
+      doc.rect(86, ry - 6, W - 36, 1).fill('#e5e7eb')
+      ry += 8
     })
+
+    // Footers solo en páginas que creamos nosotros (excluye páginas vacías auto-generadas)
+    for (let p = 1; p < misPageCount; p++) {
+      doc.switchToPage(p)
+      doc.fontSize(8).fillColor(MID).font('Helvetica')
+         .text(`${ev.ramo_nombre}  ·  APPrueba`, 50, PAGE_H - 20, { width: W, align: 'center', lineBreak: false })
+    }
 
     doc.end()
   } catch(e) {
