@@ -294,6 +294,19 @@ async function extraerContenido(archivo, enviar = () => {}) {
     }
   }
 
+  // ── PPT / PPTX ──
+  if (tipo?.includes('presentat') || tipo?.includes('powerpoint') || ['ppt','pptx'].includes(ext)) {
+    try {
+      const { parseOffice } = require('officeparser')
+      const resultado = await parseOffice(buffer, { outputErrorToConsole: false })
+      const texto = typeof resultado === 'string' ? resultado : (resultado?.text || resultado?.value || JSON.stringify(resultado))
+      console.log(`📊 PPTX extraído: ${texto.slice(0,200)}`)
+      return texto.slice(0, 15000)
+    } catch(e) {
+      console.error('Error PPTX:', e.message)
+      return '(No se pudo procesar el archivo PowerPoint)'
+    }
+  }
   return '(Formato no soportado)'
 }
 // ══════════════════════════════════════════════════════════════
@@ -754,9 +767,21 @@ Genera entre 5 y 10 tareas según la cantidad de contenido del material. Si el m
       const limiteGlobalP = limiteResP.rows.length ? parseInt(limiteResP.rows[0].valor) : 100
       if (planesUsados >= limiteGlobalP) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
     }
-    const textoLimpio = textoArchivos.replace(/--- Archivo:.*\(no se pudo extraer texto\) ---/g, '').replace(/--- Archivo:.*\(formato no soportado\) ---/g, '').trim()
-    if (textoArchivos && !textoLimpio) {
-      return terminar('error', { error: 'archivo_no_legible', mensaje: 'No pudimos leer tu archivo. Por favor sube un PDF o Word (.docx)' })
+    // Detectar archivos que fallaron
+    const archivosConError = []
+    const textoLimpio = textoArchivos.replace(/--- Contenido de ([^-]+) ---\n\(No se pudo[^)]+\)/g, (_, nombre) => {
+      archivosConError.push(nombre.trim())
+      return ''
+    }).replace(/--- Contenido de ([^-]+) ---\n\(Formato no soportado\)/g, (_, nombre) => {
+      archivosConError.push(nombre.trim())
+      return ''
+    }).trim()
+
+    if (archivosConError.length > 0 && !textoLimpio) {
+      return terminar('error', { error: 'archivo_no_legible', mensaje: `No pudimos leer el archivo "${archivosConError[0]}". Formatos soportados: PDF, Word, Excel, PowerPoint, imágenes, audio y video.` })
+    }
+    if (archivosConError.length > 0) {
+      enviar('progreso', { msg: `⚠️ No se pudo leer: ${archivosConError.join(', ')}. Continuando con el resto del material...` })
     }
 
     const promptFinal = textoArchivos 
