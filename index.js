@@ -504,10 +504,10 @@ app.get('/auth/google/callback',
 )
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro FROM usuarios WHERE id = $1', [req.user.id])
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
-  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2, es_fundador: u.es_fundador, numero_registro: u.numero_registro }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2, es_fundador: u.es_fundador, numero_registro: u.numero_registro, created_at: u.created_at }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -914,6 +914,7 @@ app.post('/auth/onboarding', authenticateToken, async (req, res) => {
       'UPDATE usuarios SET nombre = $1, universidad = $2, carrera = $3, onboarding_completado = true, onboarding_v2 = true WHERE id = $4 RETURNING id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2',
       [nombre.trim(), universidad || null, carrera ? carrera.trim() : null, req.user.id]
     )
+    if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' })
     res.json({ usuario: rows[0] })
   } catch (err) {
     console.error('Error onboarding:', err)
@@ -923,6 +924,37 @@ app.post('/auth/onboarding', authenticateToken, async (req, res) => {
 
 initDB().then(() => {
   
+
+
+// ── NOVEDADES ─────────────────────────────────────────────────────
+app.get('/novedades', authenticateToken, async (req, res) => {
+  try {
+    const { universidad } = req.query
+    const { rows } = await pool.query(
+      'SELECT * FROM novedades WHERE universidad = $1 AND activa = true ORDER BY creada_en DESC',
+      [universidad || 'ufro']
+    )
+    res.json(rows)
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/novedades', authenticateToken, async (req, res) => {
+  try {
+    const { universidad, tipo, emoji, titulo, descripcion, color } = req.body
+    const { rows } = await pool.query(
+      'INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [universidad, tipo, emoji || '📢', titulo, descripcion, color || '#60a5fa']
+    )
+    res.json(rows[0])
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
+
+app.delete('/novedades/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('UPDATE novedades SET activa = false WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch(err) { res.status(500).json({ error: err.message }) }
+})
 
 // ── HORARIO ──────────────────────────────────────────────────────
 app.get('/horario', authenticateToken, async (req, res) => {

@@ -1,3 +1,3 @@
-objc[20700]: Class GNotificationCenterDelegate is implemented in both /Users/abelespinozaviguera/apprueba-backend/node_modules/canvas/build/Release/libgio-2.0.0.dylib (0x10ae5d6d0) and /Users/abelespinozaviguera/apprueba-backend/node_modules/@img/sharp-libvips-darwin-x64/lib/libvips-cpp.8.17.3.dylib (0x10d7c2b30). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
+objc[36732]: Class GNotificationCenterDelegate is implemented in both /Users/abelespinozaviguera/apprueba-backend/node_modules/canvas/build/Release/libgio-2.0.0.dylib (0x10d2f46d0) and /Users/abelespinozaviguera/apprueba-backend/node_modules/@img/sharp-libvips-darwin-x64/lib/libvips-cpp.8.17.3.dylib (0x10fc59b30). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
 Base de datos lista ✅
 Backend corriendo en puerto 3001 🚀
