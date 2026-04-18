@@ -48,7 +48,7 @@ async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
 // EXTRACCIÓN UNIVERSAL DE CONTENIDO
 // Soporta: PDF (texto/escaneado), DOCX, XLSX, imagen, audio, video, YouTube
 // ══════════════════════════════════════════════════════════════
-const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 2, timeout: 180_000 })
 
 async function extraerContenido(archivo, enviar = () => {}) {
   const { nombre, tipo, datos } = archivo
@@ -268,12 +268,6 @@ async function extraerContenido(archivo, enviar = () => {}) {
           ffmpeg(tmpIn).toFormat('mp3').on('end', resolve).on('error', reject).save(tmpMp3)
         })
         const audioBuffer = fs.readFileSync(tmpMp3)
-        const { default: fetch } = await import('node-fetch').catch(() => ({ default: global.fetch }))
-        const FormData = (await import('form-data')).default
-        const form = new FormData()
-        form.append('file', audioBuffer, { filename: 'audio.mp3', contentType: 'audio/mpeg' })
-        form.append('model', 'whisper-1')
-        form.append('language', 'es')
         const whisperResp = await openaiClient.audio.transcriptions.create({
           file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
           model: 'whisper-1',
@@ -344,7 +338,7 @@ webpush.setVapidDetails(
 )
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 2, timeout: 180_000 })
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } })
 
 app.set('trust proxy', 1)
@@ -680,6 +674,7 @@ app.get('/ramos', authenticateToken, async (req, res) => {
         'plan_estudio', e.plan_estudio,
         'tareas_completadas', e.tareas_completadas,
         'guias_tareas', e.guias_tareas,
+        'quiz_generado', e.quiz_generado,
         'archivos', (
           SELECT json_agg(json_build_object('id', a.id, 'nombre', a.nombre, 'tipo', a.tipo))
           FROM archivos a WHERE a.evaluacion_id = e.id
@@ -794,6 +789,7 @@ app.delete('/archivos/:id', authenticateToken, async (req, res) => {
     'UPDATE evaluaciones SET texto_material = NULL, plan_estudio = NULL, guias_tareas = NULL WHERE id = $1',
     [rows[0].evaluacion_id]
   )
+  await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [rows[0].evaluacion_id])
   res.json({ ok: true })
 })
 
@@ -978,7 +974,8 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         if (!jsonMatch) throw new Error('No JSON')
         const plan = JSON.parse(jsonMatch[0])
         enviar('progreso', { msg: '✅ Plan generado, guardando...' })
-        await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2, plan_generando = FALSE WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
+        await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2, guias_tareas = NULL, plan_generando = FALSE WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
+        await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
         if (ev.plan_estudio) {
           await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [usuarioId])
         }
@@ -1008,7 +1005,8 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
           const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
           if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
           const plan2 = JSON.parse(jsonMatch2[0])
-          await pool.query('UPDATE evaluaciones SET plan_estudio = $1, plan_generando = FALSE WHERE id = $2', [JSON.stringify(plan2), evalId])
+          await pool.query('UPDATE evaluaciones SET plan_estudio = $1, guias_tareas = NULL, plan_generando = FALSE WHERE id = $2', [JSON.stringify(plan2), evalId])
+          await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
           terminar('plan', { plan: plan2 })
           await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
         } catch(fallbackErr) {
