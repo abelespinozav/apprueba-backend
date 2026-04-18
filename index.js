@@ -328,8 +328,6 @@ app.set('trust proxy', 1)
 app.use(cors({
   origin: [
     'http://localhost:5173',
-    'http://192.168.0.48:5173',
-    'http://192.168.0.48:3001',
     'https://apprueba-production.up.railway.app',
     process.env.CLIENT_URL
   ].filter(Boolean),
@@ -359,30 +357,6 @@ async function initDB() {
       min_aprobacion DECIMAL(3,1) DEFAULT 4.0,
       created_at TIMESTAMP DEFAULT NOW()
     );
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_examen DECIMAL(3,1);
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_final DECIMAL(3,1);
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS estado_final VARCHAR(50);
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS ponderacion_examen INTEGER DEFAULT 25;
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_eximicion DECIMAL(3,1);
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
-    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
-    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS quiz_generado JSONB;
-    ALTER TABLE quiz_historial ADD COLUMN IF NOT EXISTS evaluacion_id INTEGER;
-    CREATE TABLE IF NOT EXISTS quiz_historial (
-      id SERIAL PRIMARY KEY,
-      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-      evaluacion_id INTEGER REFERENCES evaluaciones(id) ON DELETE CASCADE,
-      ramo_nombre TEXT,
-      puntaje INTEGER,
-      total INTEGER,
-      porcentaje INTEGER,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
-    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_usados INTEGER DEFAULT 0;
-    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_usados INTEGER DEFAULT 0;
-    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS guias_tareas JSONB;
-    DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
     CREATE TABLE IF NOT EXISTS evaluaciones (
       id SERIAL PRIMARY KEY,
       ramo_id INTEGER REFERENCES ramos(id) ON DELETE CASCADE,
@@ -402,6 +376,101 @@ async function initDB() {
       datos BYTEA,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS quiz_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      evaluacion_id INTEGER REFERENCES evaluaciones(id) ON DELETE CASCADE,
+      ramo_nombre TEXT,
+      puntaje INTEGER,
+      total INTEGER,
+      porcentaje INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      subscription JSONB NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS push_subscriptions_unique_endpoint
+      ON push_subscriptions (usuario_id, (subscription->>'endpoint'));
+    CREATE TABLE IF NOT EXISTS notificacion_config (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER UNIQUE REFERENCES usuarios(id) ON DELETE CASCADE,
+      dias_antes INTEGER[] DEFAULT ARRAY[1,2,5],
+      activo BOOLEAN DEFAULT true,
+      notif_clases BOOLEAN DEFAULT true,
+      notif_ventanas BOOLEAN DEFAULT true
+    );
+    CREATE TABLE IF NOT EXISTS notif_enviadas (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      clave TEXT NOT NULL,
+      enviada_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(usuario_id, clave)
+    );
+    CREATE TABLE IF NOT EXISTS podcasts (
+      id SERIAL PRIMARY KEY,
+      evaluacion_id INTEGER REFERENCES evaluaciones(id) ON DELETE CASCADE,
+      tarea_idx INTEGER DEFAULT 0,
+      titulo TEXT,
+      audio TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(evaluacion_id, tarea_idx)
+    );
+    CREATE TABLE IF NOT EXISTS configuracion (
+      clave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS horario (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      dia TEXT NOT NULL,
+      hora_inicio TEXT,
+      hora_fin TEXT,
+      ramo_nombre TEXT,
+      codigo TEXT,
+      sala TEXT,
+      tipo TEXT DEFAULT 'clase',
+      periodo INTEGER,
+      UNIQUE(usuario_id, dia, periodo)
+    );
+    CREATE TABLE IF NOT EXISTS novedades (
+      id SERIAL PRIMARY KEY,
+      universidad TEXT NOT NULL,
+      tipo TEXT,
+      emoji TEXT DEFAULT '📢',
+      titulo TEXT NOT NULL,
+      descripcion TEXT,
+      color TEXT DEFAULT '#60a5fa',
+      activa BOOLEAN DEFAULT true,
+      creada_en TIMESTAMP DEFAULT NOW()
+    );
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS universidad TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carrera TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS onboarding_completado BOOLEAN DEFAULT false;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS onboarding_v2 BOOLEAN DEFAULT false;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_fundador BOOLEAN DEFAULT false;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS numero_registro INTEGER;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_admin BOOLEAN DEFAULT false;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS podcasts_usados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_usados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_usados INTEGER DEFAULT 0;
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_examen DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_final DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS estado_final VARCHAR(50);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS ponderacion_examen INTEGER DEFAULT 25;
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_eximicion DECIMAL(3,1);
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS condiciones_eximicion TEXT;
+    ALTER TABLE ramos ADD COLUMN IF NOT EXISTS sin_rojos BOOLEAN DEFAULT false;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS quiz_generado JSONB;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS guias_tareas JSONB;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS texto_material TEXT;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS plan_generando BOOLEAN DEFAULT false;
+    ALTER TABLE quiz_historial ADD COLUMN IF NOT EXISTS evaluacion_id INTEGER;
+    DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
   console.log('Base de datos lista ✅')
 }
@@ -457,12 +526,21 @@ app.post('/auth/register', async (req, res) => {
     if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' })
     const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email])
     if (existe.rows.length > 0) return res.status(400).json({ error: 'El email ya está registrado' })
+    const { rows: countRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios')
+    if (parseInt(countRows[0].total) >= 50) {
+      return res.status(403).json({ error: 'lista_espera', mensaje: 'Los cupos están llenos' })
+    }
     const hash = await bcrypt.hash(password, 10)
     const result = await pool.query(
       'INSERT INTO usuarios (nombre, email, password_hash) VALUES ($1, $2, $3) RETURNING id, nombre, email, avatar',
       [nombre, email, hash]
     )
     const usuario = result.rows[0]
+    const { rows: fundRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
+    if (parseInt(fundRows[0].total) < 50) {
+      await pool.query('UPDATE usuarios SET es_fundador = TRUE WHERE id = $1', [usuario.id])
+      usuario.es_fundador = true
+    }
     const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
     res.json({ token, usuario })
   } catch (err) {
@@ -499,9 +577,32 @@ app.get('/auth/google/callback',
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     )
-    res.redirect(`${process.env.CLIENT_URL}?token=${token}`)
+    res.cookie('auth_bridge', token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
+      maxAge: 60_000
+    })
+    res.redirect(`${process.env.CLIENT_URL}?auth=success`)
   }
 )
+
+app.post('/auth/exchange', async (req, res) => {
+  const token = req.cookies.auth_bridge
+  if (!token) return res.status(401).json({ error: 'No hay cookie de autenticación' })
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET)
+    const { rows } = await pool.query(
+      'SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1',
+      [decoded.id]
+    )
+    if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
+    res.clearCookie('auth_bridge', { httpOnly: true, secure: true, sameSite: 'none' })
+    res.json({ token, usuario: rows[0] })
+  } catch {
+    res.status(401).json({ error: 'Token inválido' })
+  }
+})
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
   const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
@@ -525,6 +626,19 @@ function authenticateToken(req, res, next) {
     next()
   } catch {
     res.status(401).json({ error: 'Token inválido' })
+  }
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    const { rows } = await pool.query('SELECT es_admin FROM usuarios WHERE id = $1', [req.user.id])
+    if (!rows[0] || !rows[0].es_admin) {
+      return res.status(403).json({ error: 'Acceso denegado: se requiere rol admin' })
+    }
+    next()
+  } catch (e) {
+    console.error('requireAdmin error:', e.message)
+    res.status(500).json({ error: 'Error de autorización' })
   }
 }
 
@@ -587,7 +701,12 @@ app.post('/ramos', authenticateToken, async (req, res) => {
 
 app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
   const { nota } = req.body
-  await pool.query('UPDATE evaluaciones SET nota = $1 WHERE id = $2', [nota || null, req.params.id])
+  const { rowCount } = await pool.query(
+    `UPDATE evaluaciones SET nota = $1
+     WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
+    [nota || null, req.params.id, req.user.id]
+  )
+  if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
   res.json({ ok: true })
 })
 
@@ -617,6 +736,12 @@ app.get('/evaluaciones/:id/archivos', authenticateToken, async (req, res) => {
 app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se recibió archivo' })
+    const { rows: check } = await pool.query(
+      `SELECT e.id FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id
+       WHERE e.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (check.length === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const { rows } = await pool.query(
       'INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4) RETURNING id, nombre, tipo',
       [req.params.id, req.file.originalname, req.file.mimetype, req.file.buffer]
@@ -630,18 +755,19 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
 
 // Eliminar archivo
 app.delete('/archivos/:id', authenticateToken, async (req, res) => {
-  // Obtener evaluacion_id antes de eliminar
-  const { rows } = await pool.query('SELECT evaluacion_id FROM archivos WHERE id = $1', [req.params.id])
+  const { rows } = await pool.query(
+    `SELECT a.evaluacion_id FROM archivos a
+     JOIN evaluaciones e ON e.id = a.evaluacion_id
+     JOIN ramos r ON r.id = e.ramo_id
+     WHERE a.id = $1 AND r.usuario_id = $2`,
+    [req.params.id, req.user.id]
+  )
+  if (rows.length === 0) return res.status(404).json({ error: 'Archivo no encontrado' })
   await pool.query('DELETE FROM archivos WHERE id = $1', [req.params.id])
-  // Invalidar texto_material y guias_tareas para que se regeneren con material actualizado
-  if (rows[0]?.evaluacion_id) {
-    const evalId = rows[0].evaluacion_id
-    // Siempre resetear plan al eliminar cualquier archivo
-    await pool.query(
-      'UPDATE evaluaciones SET texto_material = NULL, guias_tareas = NULL, plan_estudio = NULL WHERE id = $1',
-      [evalId]
-    )
-  }
+  await pool.query(
+    'UPDATE evaluaciones SET texto_material = NULL, plan_estudio = NULL, guias_tareas = NULL WHERE id = $1',
+    [rows[0].evaluacion_id]
+  )
   res.json({ ok: true })
 })
 
@@ -899,7 +1025,12 @@ app.get('/evaluaciones/:id/plan-estado', authenticateToken, async (req, res) => 
 // Actualizar progreso del plan
 app.post('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) => {
   const { completadas } = req.body
-  await pool.query('UPDATE evaluaciones SET tareas_completadas = $1 WHERE id = $2', [completadas, req.params.id])
+  const { rowCount } = await pool.query(
+    `UPDATE evaluaciones SET tareas_completadas = $1
+     WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
+    [completadas, req.params.id, req.user.id]
+  )
+  if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
   res.json({ ok: true })
 })
 
@@ -930,11 +1061,111 @@ initDB().then(() => {
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
     const { universidad } = req.query
+    const uni = universidad || 'ufro'
     const { rows } = await pool.query(
       'SELECT * FROM novedades WHERE universidad = $1 AND activa = true ORDER BY creada_en DESC',
-      [universidad || 'ufro']
+      [uni]
     )
-    res.json(rows)
+    if (rows.length > 0) return res.json(rows)
+
+    // Fallback: WordPress REST API de UFRO
+    if (uni === 'ufro') {
+      try {
+        const axios = require('axios')
+        const novedades = []
+
+        // Noticias via WP API
+        const { data: posts } = await axios.get(
+          'https://www.ufro.cl/wp-json/wp/v2/posts?per_page=4&_fields=title,excerpt,date,link',
+          { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+        )
+        for (const post of posts) {
+          const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+          const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+          if (titulo) novedades.push({ tipo: 'Noticia', emoji: '📰', titulo: titulo.slice(0, 75), descripcion: desc ? desc.slice(0, 70) : "UFRO al día", color: '#60a5fa', link: post.link })
+        }
+
+        // Eventos via scraping de /agenda/
+        try {
+          const { data: agendaHtml } = await axios.get(
+            'https://www.ufro.cl/agenda/',
+            { timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+          )
+          const cheerio = require('cheerio')
+          const $a = cheerio.load(agendaHtml)
+          const eventosVistos = new Set()
+          // Buscar artículos o entradas de agenda en el contenido principal
+          // Los eventos en UFRO aparecen como li con fecha debajo de h2
+          $a('.entry-content li, article h2, .agenda h2, main h2').each((i, el) => {
+            if (eventosVistos.size >= 3) return
+            const titulo = $a(el).text().trim()
+            const fecha = $a(el).next().text().trim().replace(/\n/g,' ').slice(0,40)
+            if (titulo && titulo.length > 10 && titulo.length < 120 && !eventosVistos.has(titulo)) {
+              eventosVistos.add(titulo)
+              novedades.push({
+                tipo: 'Evento', emoji: '📅',
+                titulo: titulo.slice(0, 75),
+                descripcion: fecha || 'Ver agenda UFRO',
+                color: '#a78bfa',
+                link: 'https://www.ufro.cl/agenda/'
+              })
+            }
+          })
+          // Fallback: parsear h2 del HTML como string
+          if (eventosVistos.size === 0) {
+            const h2regex = new RegExp('<h2[^>]*>([^<]{10,100})<\/h2>', 'g')
+            const navWords = ['Institucional','Organización','Facultades','Pregrado','Postgrado','Investigación','Vinculación','Internacionalización','Educación']
+            let match
+            while ((match = h2regex.exec(agendaHtml)) !== null) {
+              if (eventosVistos.size >= 3) break
+              const titulo = match[1].trim()
+              if (navWords.every(w => titulo.indexOf(w) === -1) && titulo.length > 10) {
+                eventosVistos.add(titulo)
+                novedades.push({
+                  tipo: 'Evento', emoji: '📅',
+                  titulo: titulo.slice(0, 75),
+                  descripcion: 'Ver agenda UFRO',
+                  color: '#a78bfa',
+                  link: 'https://www.ufro.cl/agenda/'
+                })
+              }
+            }
+          }
+        } catch(e) { console.log('Agenda scraping falló:', e.message) }
+
+        // Noticias DDE (Desarrollo Estudiantil)
+        try {
+          const { data: ddeHtml } = await axios.get(
+            'https://dde.ufro.cl/noticias/',
+            { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+          )
+          const cheerio2 = require('cheerio')
+          const $d = cheerio2.load(ddeHtml)
+          let ddeCount = 0
+          $d('a').each((i, el) => {
+            if (ddeCount >= 2) return
+            const titulo = $d(el).text().trim().replace(/\s+/g, ' ')
+            const href = $d(el).attr('href') || ''
+            if (titulo && titulo.length > 15 && titulo.length < 150 && href && href !== 'https://dde.ufro.cl/noticias/') {
+              novedades.push({
+                tipo: 'Vida Estudiantil', emoji: '🎓',
+                titulo: titulo.slice(0, 75),
+                descripcion: 'DDE · Desarrollo Estudiantil UFRO',
+                color: '#34d399',
+                link: href
+              })
+              ddeCount++
+            }
+          })
+        } catch(e) { console.log('DDE scraping falló:', e.message) }
+
+        if (novedades.length > 0) return res.json(novedades.slice(0, 6))
+      } catch(scrapeErr) {
+        console.log('API UFRO falló:', scrapeErr.message)
+      }
+    }
+
+    res.json([])
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
 
@@ -1066,14 +1297,14 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
       for (let r = headerRow + 1; r < data.length; r++) {
         const row = data[r]
         const periodoCell = String(row[0] || '')
-        const horaMatch = periodoCell.match(/(d{1,2}:d{2})/)
+        const horaMatch = periodoCell.match(/(\d{1,2}:\d{2})/)
         if (!horaMatch) continue
         
         // Buscar hora inicio y fin
         let hora_inicio = '', hora_fin = ''
         for (let c = 0; c < row.length; c++) {
           const val = String(row[c] || '')
-          const horas = val.match(/(d{1,2}:d{2})/g)
+          const horas = val.match(/(\d{1,2}:\d{2})/g)
           if (horas && horas.length >= 2) { hora_inicio = horas[0]; hora_fin = horas[1]; break }
           if (horas && horas.length === 1 && !hora_inicio) hora_inicio = horas[0]
         }
@@ -1118,7 +1349,7 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
         if (partes.length < 2) continue
 
         let tipo = 'clase'
-        const bgMatch = cell.match(/background-colors*:s*([#w]+)/i) || cell.match(/bgcolor=["']?([#w]+)/i)
+        const bgMatch = cell.match(/background-color\s*:\s*([#\w]+)/i) || cell.match(/bgcolor=["']?([#\w]+)/i)
         if (bgMatch) {
           const color = bgMatch[1].toLowerCase().replace('#','')
           if (['ffd700','ffa500','ffb300','f90'].some(c => color.includes(c))) tipo = 'topon'
@@ -1198,7 +1429,7 @@ app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (
 })
 
 // Panel admin - solo abelespinozav@gmail.com
-app.get('/admin/stats', authenticateToken, async (req, res) => {
+app.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const usuarios = await pool.query(`
@@ -1228,7 +1459,7 @@ app.get('/admin/stats', authenticateToken, async (req, res) => {
 
 
 // Detalle completo de un usuario (solo admin)
-app.get('/admin/usuario/:id/detalle', authenticateToken, async (req, res) => {
+app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const uid = req.params.id
@@ -1271,7 +1502,7 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, async (req, res) => {
 })
 
 // Eliminar usuario (solo admin)
-app.delete('/admin/usuario/:id', authenticateToken, async (req, res) => {
+app.delete('/admin/usuario/:id', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   if (parseInt(req.params.id) === req.user.id) return res.status(400).json({ error: 'No puedes eliminarte a ti mismo' })
   try {
@@ -1281,7 +1512,7 @@ app.delete('/admin/usuario/:id', authenticateToken, async (req, res) => {
 })
 
 // Reset contadores de un usuario (solo admin)
-app.post('/admin/limite-global', authenticateToken, async (req, res) => {
+app.post('/admin/limite-global', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { limite } = req.body
     if (typeof limite !== 'number' || limite < 0) return res.status(400).json({ error: 'Límite inválido' })
@@ -1293,7 +1524,7 @@ app.post('/admin/limite-global', authenticateToken, async (req, res) => {
   }
 })
 
-app.get('/admin/limite-global', authenticateToken, async (req, res) => {
+app.get('/admin/limite-global', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limite = rows.length ? parseInt(rows[0].valor) : 100
@@ -1303,7 +1534,17 @@ app.get('/admin/limite-global', authenticateToken, async (req, res) => {
   }
 })
 
-app.post('/admin/reset-contadores', authenticateToken, async (req, res) => {
+app.get('/config/limite-global', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
+    const limite = rows.length ? parseInt(rows[0].valor) : 100
+    res.json({ limite })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/admin/reset-contadores', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const { usuario_id, campo } = req.body
@@ -1372,7 +1613,7 @@ app.post('/notificaciones/config', authenticateToken, async (req, res) => {
 // Endpoint para obtener la VAPID public key
 
 // Broadcast notificación a todos los usuarios (solo admin)
-app.post('/admin/notificacion-broadcast', authenticateToken, async (req, res) => {
+app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const { titulo, mensaje, url } = req.body
@@ -1815,20 +2056,6 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
 app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en puerto ${process.env.PORT || 3001} 🚀`))
 })
 
-// Actualizar progreso del plan
-app.put('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) => {
-  try {
-    const { tareas_completadas } = req.body
-    await pool.query(
-      'UPDATE evaluaciones SET tareas_completadas = $1 WHERE id = $2',
-      [tareas_completadas, req.params.id]
-    )
-    res.json({ ok: true })
-  } catch (err) {
-    console.error('Error actualizando progreso:', err)
-    res.status(500).json({ error: 'Error al actualizar progreso' })
-  }
-})
 
 // Generar o recuperar guía de estudio para una tarea específica
 app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => {
@@ -1970,10 +2197,13 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
 app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
   try {
     const { nota } = req.body
-    await pool.query(
-      'UPDATE evaluaciones SET nota = $1 WHERE id = $2',
-      [nota || null, req.params.evalId]
+    const { rowCount } = await pool.query(
+      `UPDATE evaluaciones SET nota = $1
+       WHERE id = $2 AND ramo_id = $3
+       AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $4)`,
+      [nota || null, req.params.evalId, req.params.ramoId, req.user.id]
     )
+    if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
     res.json({ ok: true })
   } catch (err) {
     console.error('Error actualizando nota:', err)
