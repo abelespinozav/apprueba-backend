@@ -459,6 +459,8 @@ async function initDB() {
       periodo INTEGER,
       UNIQUE(usuario_id, dia, periodo)
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS horario_usuario_dia_inicio_idx
+      ON horario(usuario_id, dia, hora_inicio);
     CREATE TABLE IF NOT EXISTS novedades (
       id SERIAL PRIMARY KEY,
       universidad TEXT NOT NULL,
@@ -1229,8 +1231,8 @@ app.post('/horario', authenticateToken, async (req, res) => {
     await pool.query(
       `INSERT INTO horario (usuario_id, dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (usuario_id, dia, periodo)
-       DO UPDATE SET hora_inicio=$3, hora_fin=$4, ramo_nombre=$5, codigo=$6, sala=$7, tipo=$8`,
+       ON CONFLICT (usuario_id, dia, hora_inicio)
+       DO UPDATE SET hora_fin=$4, ramo_nombre=$5, codigo=$6, sala=$7, tipo=$8`,
       [req.user.id, dia, hora_inicio, hora_fin, ramo_nombre, codigo, sala, tipo || 'clase']
     )
     // Auto-crear ramo si no existe
