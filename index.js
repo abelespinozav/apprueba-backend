@@ -8,7 +8,6 @@ const { Strategy: GoogleStrategy } = require('passport-google-oauth20')
 const jwt = require('jsonwebtoken')
 const { Pool } = require('pg')
 const multer = require('multer')
-const { GoogleGenerativeAI } = require('@google/generative-ai')
 const webpush = require('web-push')
 const cron = require('node-cron')
 const { extraerTextoPDF, pdfAImagenes } = require('./pdfExtractor')
@@ -58,6 +57,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
   // ── YouTube URL ──
   if (archivo.youtubeUrl) {
     const tmpAudio = path.join(os.tmpdir(), `yt_${Date.now()}.mp3`)
+    let chunkDir = null
     try {
       const videoId = archivo.youtubeUrl.match(/(?:v=|youtu\.be\/)([\w-]{11})/)?.[1]
       if (!videoId) return '(No se pudo extraer el ID del video de YouTube)'
@@ -89,7 +89,6 @@ async function extraerContenido(archivo, enviar = () => {}) {
         console.log(`🎤 Transcribiendo audio de YouTube con Whisper...`)
         enviar('progreso', { msg: '🎤 Transcribiendo audio...' })
         const audioBuffer = fs.readFileSync(audioFinal)
-        fs.unlinkSync(audioFinal)
         const whisperResp = await openaiClient.audio.transcriptions.create({
           file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
           model: 'whisper-1',
@@ -100,7 +99,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
         // Dividir en chunks de 15 minutos
         console.log(`🎬 Audio grande (${Math.round(audioSize/1024/1024)}MB), dividiendo en chunks...`)
         enviar('progreso', { msg: `🎬 Video largo detectado (${Math.round(audioSize/1024/1024)}MB), dividiendo en partes...` })
-        const chunkDir = `/tmp/chunks_${videoId}_${Date.now()}`
+        chunkDir = `/tmp/chunks_${videoId}_${Date.now()}`
         fs.mkdirSync(chunkDir, { recursive: true })
         await new Promise((resolve, reject) => {
           exec(
@@ -109,7 +108,6 @@ async function extraerContenido(archivo, enviar = () => {}) {
             (err) => { if (err) reject(err); else resolve() }
           )
         })
-        fs.unlinkSync(audioFinal)
         const chunks = fs.readdirSync(chunkDir).filter(f => f.endsWith('.mp3')).sort()
         console.log(`🎤 Transcribiendo ${chunks.length} chunks con Whisper...`)
         enviar('progreso', { msg: `🎤 Transcribiendo ${chunks.length} partes del audio...` })
@@ -118,22 +116,28 @@ async function extraerContenido(archivo, enviar = () => {}) {
           console.log(`🎤 Chunk ${i+1}/${chunks.length}...`)
           enviar('progreso', { msg: `🎤 Transcribiendo parte ${i+1} de ${chunks.length}...` })
           const chunkBuffer = fs.readFileSync(chunkPath)
-          fs.unlinkSync(chunkPath)
-          const resp = await openaiClient.audio.transcriptions.create({
-            file: new File([chunkBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
-            model: 'whisper-1',
-            language: 'es'
-          })
-          transcripcionCompleta += resp.text + ' '
+          try { fs.unlinkSync(chunkPath) } catch(_) {}
+          try {
+            const resp = await openaiClient.audio.transcriptions.create({
+              file: new File([chunkBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+              model: 'whisper-1',
+              language: 'es'
+            })
+            if (!resp.text || !resp.text.trim()) {
+              console.warn(`⚠️ Chunk ${i+1}/${chunks.length} devolvió texto vacío`)
+            }
+            transcripcionCompleta += (resp.text || '') + ' '
+          } catch(err) {
+            console.error(`❌ Chunk ${i+1}/${chunks.length} falló:`, err.message)
+            enviar('progreso', { msg: `⚠️ Parte ${i+1} falló — continuando con las demás` })
+          }
         }
-        try { fs.rmdirSync(chunkDir) } catch(_) {}
       }
       console.log(`🎬 YouTube transcrito completo: ${transcripcionCompleta.slice(0,200)}`)
       enviar('progreso', { msg: '✅ Audio transcrito, analizando contenido...' })
       return transcripcionCompleta
     } catch(e) {
       console.error('Error YouTube yt-dlp:', e.message)
-      if (fs.existsSync(tmpAudio)) fs.unlinkSync(tmpAudio)
       // Fallback: intentar metadata con youtubei.js
       try {
         const { Innertube } = await import('youtubei.js')
@@ -146,6 +150,13 @@ async function extraerContenido(archivo, enviar = () => {}) {
       } catch(e2) {
         return '(No se pudo procesar el video de YouTube)'
       }
+    } finally {
+      try { if (fs.existsSync(tmpAudio)) fs.unlinkSync(tmpAudio) } catch(_) {}
+      try {
+        const alt = tmpAudio.replace('.mp3', '.mp3.mp3')
+        if (fs.existsSync(alt)) fs.unlinkSync(alt)
+      } catch(_) {}
+      try { if (chunkDir) fs.rmSync(chunkDir, { recursive: true, force: true }) } catch(_) {}
     }
   }
 
@@ -163,23 +174,31 @@ async function extraerContenido(archivo, enviar = () => {}) {
       // PDF escaneado → Vision
       console.log(`🔍 PDF escaneado, usando Vision...`)
       const tmpPdf = path.join(os.tmpdir(), `apprueba_${Date.now()}.pdf`)
-      fs.writeFileSync(tmpPdf, buffer)
-      const converter = pdf2pic.fromPath(tmpPdf, { density: 300, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
-      const pages = await converter.bulk(-1, { responseType: 'base64' })
-      fs.unlinkSync(tmpPdf)
-      const imagenes = pages.slice(0, 5).map(p => ({
-        type: 'image_url',
-        image_url: { url: `data:image/png;base64,${p.base64}`, detail: 'high' }
-      }))
-      const resp = await openaiClient.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: [
-          { type: 'text', text: 'Extrae y transcribe todo el texto de estas páginas de apuntes universitarios. Incluye fórmulas, títulos, listas y todo el contenido relevante.' },
-          ...imagenes
-        ]}],
-        max_tokens: 4000
-      })
-      return resp.choices[0].message.content.slice(0, 15000)
+      let pngFiles = []
+      try {
+        fs.writeFileSync(tmpPdf, buffer)
+        const converter = pdf2pic.fromPath(tmpPdf, { density: 300, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
+        const pages = await converter.bulk(-1, { responseType: 'base64' })
+        pngFiles = pages.map(p => p.path).filter(Boolean)
+        const imagenes = pages.slice(0, 5).map(p => ({
+          type: 'image_url',
+          image_url: { url: `data:image/png;base64,${p.base64}`, detail: 'high' }
+        }))
+        const resp = await openaiClient.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: [
+            { type: 'text', text: 'Extrae y transcribe todo el texto de estas páginas de apuntes universitarios. Incluye fórmulas, títulos, listas y todo el contenido relevante.' },
+            ...imagenes
+          ]}],
+          max_tokens: 4000
+        })
+        return resp.choices[0].message.content.slice(0, 15000)
+      } finally {
+        try { if (fs.existsSync(tmpPdf)) fs.unlinkSync(tmpPdf) } catch(_) {}
+        for (const f of pngFiles) {
+          try { if (fs.existsSync(f)) fs.unlinkSync(f) } catch(_) {}
+        }
+      }
     } catch(e) {
       console.error('Error PDF:', e.message)
       return '(No se pudo procesar el PDF)'
@@ -243,26 +262,29 @@ async function extraerContenido(archivo, enviar = () => {}) {
     try {
       const tmpIn = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.${ext || 'mp3'}`)
       const tmpMp3 = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.mp3`)
-      fs.writeFileSync(tmpIn, buffer)
-      await new Promise((resolve, reject) => {
-        ffmpeg(tmpIn).toFormat('mp3').on('end', resolve).on('error', reject).save(tmpMp3)
-      })
-      const audioBuffer = fs.readFileSync(tmpMp3)
-      fs.unlinkSync(tmpIn)
-      fs.unlinkSync(tmpMp3)
-      const { default: fetch } = await import('node-fetch').catch(() => ({ default: global.fetch }))
-      const FormData = (await import('form-data')).default
-      const form = new FormData()
-      form.append('file', audioBuffer, { filename: 'audio.mp3', contentType: 'audio/mpeg' })
-      form.append('model', 'whisper-1')
-      form.append('language', 'es')
-      const whisperResp = await openaiClient.audio.transcriptions.create({
-        file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
-        model: 'whisper-1',
-        language: 'es'
-      })
-      console.log(`🎤 Audio transcrito: ${whisperResp.text.slice(0,200)}`)
-      return whisperResp.text.slice(0, 15000)
+      try {
+        fs.writeFileSync(tmpIn, buffer)
+        await new Promise((resolve, reject) => {
+          ffmpeg(tmpIn).toFormat('mp3').on('end', resolve).on('error', reject).save(tmpMp3)
+        })
+        const audioBuffer = fs.readFileSync(tmpMp3)
+        const { default: fetch } = await import('node-fetch').catch(() => ({ default: global.fetch }))
+        const FormData = (await import('form-data')).default
+        const form = new FormData()
+        form.append('file', audioBuffer, { filename: 'audio.mp3', contentType: 'audio/mpeg' })
+        form.append('model', 'whisper-1')
+        form.append('language', 'es')
+        const whisperResp = await openaiClient.audio.transcriptions.create({
+          file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+          model: 'whisper-1',
+          language: 'es'
+        })
+        console.log(`🎤 Audio transcrito: ${whisperResp.text.slice(0,200)}`)
+        return whisperResp.text.slice(0, 15000)
+      } finally {
+        try { if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn) } catch(_) {}
+        try { if (fs.existsSync(tmpMp3)) fs.unlinkSync(tmpMp3) } catch(_) {}
+      }
     } catch(e) {
       console.error('Error audio Whisper:', e.message)
       return '(No se pudo transcribir el audio)'
@@ -274,20 +296,23 @@ async function extraerContenido(archivo, enviar = () => {}) {
     try {
       const tmpVideo = path.join(os.tmpdir(), `apprueba_video_${Date.now()}.${ext || 'mp4'}`)
       const tmpAudio = path.join(os.tmpdir(), `apprueba_audio_${Date.now()}.mp3`)
-      fs.writeFileSync(tmpVideo, buffer)
-      await new Promise((resolve, reject) => {
-        ffmpeg(tmpVideo).noVideo().audioCodec('libmp3lame').on('end', resolve).on('error', reject).save(tmpAudio)
-      })
-      const audioBuffer = fs.readFileSync(tmpAudio)
-      fs.unlinkSync(tmpVideo)
-      fs.unlinkSync(tmpAudio)
-      const whisperResp = await openaiClient.audio.transcriptions.create({
-        file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
-        model: 'whisper-1',
-        language: 'es'
-      })
-      console.log(`🎥 Video transcrito: ${whisperResp.text.slice(0,200)}`)
-      return whisperResp.text.slice(0, 15000)
+      try {
+        fs.writeFileSync(tmpVideo, buffer)
+        await new Promise((resolve, reject) => {
+          ffmpeg(tmpVideo).noVideo().audioCodec('libmp3lame').on('end', resolve).on('error', reject).save(tmpAudio)
+        })
+        const audioBuffer = fs.readFileSync(tmpAudio)
+        const whisperResp = await openaiClient.audio.transcriptions.create({
+          file: new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
+          model: 'whisper-1',
+          language: 'es'
+        })
+        console.log(`🎥 Video transcrito: ${whisperResp.text.slice(0,200)}`)
+        return whisperResp.text.slice(0, 15000)
+      } finally {
+        try { if (fs.existsSync(tmpVideo)) fs.unlinkSync(tmpVideo) } catch(_) {}
+        try { if (fs.existsSync(tmpAudio)) fs.unlinkSync(tmpAudio) } catch(_) {}
+      }
     } catch(e) {
       console.error('Error video:', e.message)
       return '(No se pudo procesar el video)'
@@ -319,7 +344,6 @@ webpush.setVapidDetails(
 )
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } })
 
@@ -779,9 +803,10 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders()
   const enviar = (tipo, datos) => {
-    res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
+    if (!res.destroyed) res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
   }
   const terminar = (tipo, datos) => {
+    if (res.destroyed) return
     res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
     res.end()
   }
@@ -2269,7 +2294,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     res.flushHeaders()
 
     const enviar = (tipo, datos) => {
-      res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
+      if (!res.destroyed) res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
     }
 
     enviar('progreso', { msg: '🧠 Iniciando generación del quiz...' })
@@ -2294,7 +2319,8 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
         }
         if (!textoArchivos.trim()) {
           enviar('error', { error: 'sin_contenido', mensaje: 'No se pudo extraer texto del material subido' })
-          return res.end()
+          if (!res.destroyed) res.end()
+          return
         }
         enviar('progreso', { msg: '🤖 Generando 20 preguntas con IA...' })
         const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
@@ -2358,11 +2384,11 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
         await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [usuarioId])
         enviar('quiz', { preguntas: quizData.preguntas })
-        res.end()
+        if (!res.destroyed) res.end()
       } catch (err) {
         console.error('Error generando quiz:', err)
         enviar('error', { error: 'fallo_ia', mensaje: 'Error al generar quiz: ' + err.message })
-        res.end()
+        if (!res.destroyed) res.end()
       }
     })
   } catch (err) {
