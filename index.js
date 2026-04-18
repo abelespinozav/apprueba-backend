@@ -111,25 +111,54 @@ async function extraerContenido(archivo, enviar = () => {}) {
         const chunks = fs.readdirSync(chunkDir).filter(f => f.endsWith('.mp3')).sort()
         console.log(`🎤 Transcribiendo ${chunks.length} chunks con Whisper...`)
         enviar('progreso', { msg: `🎤 Transcribiendo ${chunks.length} partes del audio...` })
+        const retryWhisper = async (buf, numChunk, totalChunks, maxIntentos = 3) => {
+          let lastErr
+          for (let intento = 1; intento <= maxIntentos; intento++) {
+            try {
+              return await openaiClient.audio.transcriptions.create({
+                file: new File([buf], 'audio.mp3', { type: 'audio/mpeg' }),
+                model: 'whisper-1',
+                language: 'es'
+              })
+            } catch(err) {
+              lastErr = err
+              if (err.status === 401 || err.status === 403) throw err
+              if (intento < maxIntentos) {
+                const delay = Math.pow(2, intento - 1) * 1000
+                console.warn(`⚠️ Chunk ${numChunk}/${totalChunks} intento ${intento} falló (${err.status || err.code || 'error'}), reintentando en ${delay}ms`)
+                enviar('progreso', { msg: `⏳ Parte ${numChunk}/${totalChunks} reintentando (${intento}/${maxIntentos})...` })
+                await new Promise(r => setTimeout(r, delay))
+              }
+            }
+          }
+          throw lastErr
+        }
+        let exitosos = 0
+        let fallidos = 0
+        const tInicio = Date.now()
         for (let i = 0; i < chunks.length; i++) {
           const chunkPath = `${chunkDir}/${chunks[i]}`
-          console.log(`🎤 Chunk ${i+1}/${chunks.length}...`)
-          enviar('progreso', { msg: `🎤 Transcribiendo parte ${i+1} de ${chunks.length}...` })
           const chunkBuffer = fs.readFileSync(chunkPath)
           try { fs.unlinkSync(chunkPath) } catch(_) {}
+          const elapsed = Date.now() - tInicio
+          const avg = i > 0 ? elapsed / i : 0
+          const etaMin = avg > 0 ? Math.max(1, Math.round(avg * (chunks.length - i) / 60000)) : null
+          const stats = (exitosos + fallidos > 0) ? ` · ✓${exitosos} ✗${fallidos}` : ''
+          const etaTxt = etaMin ? ` · ~${etaMin}min` : ''
+          console.log(`🎤 Chunk ${i+1}/${chunks.length}...`)
+          enviar('progreso', { msg: `🎤 Parte ${i+1}/${chunks.length}${etaTxt}${stats}` })
           try {
-            const resp = await openaiClient.audio.transcriptions.create({
-              file: new File([chunkBuffer], 'audio.mp3', { type: 'audio/mpeg' }),
-              model: 'whisper-1',
-              language: 'es'
-            })
+            const resp = await retryWhisper(chunkBuffer, i+1, chunks.length)
             if (!resp.text || !resp.text.trim()) {
               console.warn(`⚠️ Chunk ${i+1}/${chunks.length} devolvió texto vacío`)
             }
             transcripcionCompleta += (resp.text || '') + ' '
+            exitosos++
           } catch(err) {
-            console.error(`❌ Chunk ${i+1}/${chunks.length} falló:`, err.message)
-            enviar('progreso', { msg: `⚠️ Parte ${i+1} falló — continuando con las demás` })
+            console.error(`❌ Chunk ${i+1}/${chunks.length} falló definitivamente (${err.status || err.code || 'error'}): ${err.message}`)
+            const motivo = err.status === 401 ? 'auth' : err.status === 403 ? 'permisos' : 'error'
+            enviar('progreso', { msg: `⚠️ Parte ${i+1} no se pudo transcribir (${motivo}) — continuando con las demás` })
+            fallidos++
           }
         }
       }
@@ -318,11 +347,44 @@ async function extraerContenido(archivo, enviar = () => {}) {
     try {
       const { parseOffice } = require('officeparser')
       const resultado = await parseOffice(buffer, { outputErrorToConsole: false })
-      const texto = typeof resultado === 'string' ? resultado : (resultado?.text || resultado?.value || JSON.stringify(resultado))
-      console.log(`📊 PPTX extraído: ${texto.slice(0,200)}`)
-      return texto.slice(0, 15000)
+      const texto = (typeof resultado === 'string' ? resultado : (resultado?.text || resultado?.value || '')).trim()
+      if (texto.length > 100) {
+        console.log(`📊 PPTX texto extraído: ${texto.slice(0,200)}`)
+        return texto.slice(0, 15000)
+      }
+      // PPTX con poco/ningún texto → extraer imágenes embebidas y OCR con Vision
+      console.log(`🔍 PPTX con ${texto.length} chars de texto, usando Vision sobre imágenes embebidas...`)
+      enviar('progreso', { msg: '🔍 PPTX con pocas palabras, leyendo imágenes...' })
+      const JSZip = require('jszip')
+      const zip = await JSZip.loadAsync(buffer)
+      const imageFiles = Object.keys(zip.files)
+        .filter(name => /^ppt\/media\/.*\.(png|jpe?g|gif|webp)$/i.test(name))
+        .sort()
+      if (imageFiles.length === 0) {
+        console.log(`📊 PPTX sin imágenes embebidas, devolviendo texto disponible`)
+        return texto || '(PPTX sin contenido legible)'
+      }
+      const imagenes = []
+      for (const name of imageFiles.slice(0, 5)) {
+        const imgBuffer = await zip.files[name].async('nodebuffer')
+        const imgExt = name.split('.').pop().toLowerCase()
+        const mime = imgExt === 'png' ? 'image/png' : 'image/jpeg'
+        const b64 = imgBuffer.toString('base64')
+        imagenes.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${b64}`, detail: 'high' } })
+      }
+      const resp = await openaiClient.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: 'Son slides de una presentación universitaria chilena (probablemente apuntes escaneados insertados como imágenes). Extrae y transcribe todo el texto visible, fórmulas, diagramas descritos en palabras, títulos y contenido relevante para estudiar. Responde en español.' },
+          ...imagenes
+        ]}],
+        max_tokens: 4000
+      })
+      const textoOCR = resp.choices[0].message.content || ''
+      console.log(`🖼️ PPTX procesado con Vision: ${textoOCR.slice(0,200)}`)
+      return ((texto ? texto + '\n\n' : '') + textoOCR).slice(0, 15000)
     } catch(e) {
-      console.error('Error PPTX:', e.message)
+      console.error(`Error PPTX (${e.code || e.name || 'unknown'}): ${e.message}`)
       return '(No se pudo procesar el archivo PowerPoint)'
     }
   }
