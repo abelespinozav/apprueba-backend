@@ -2646,18 +2646,33 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
 
 app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
   try {
-    const { nota } = req.body
+    const ALLOWED = ['nota', 'nombre', 'fecha', 'ponderacion']
+    const sets = []
+    const vals = []
+    for (const f of ALLOWED) {
+      if (!(f in req.body)) continue
+      let v = req.body[f]
+      if (f === 'nota') v = (v === '' || v === null || v === undefined) ? null : parseFloat(v)
+      if (f === 'fecha') v = (v === '' || v === null) ? null : v
+      if (f === 'ponderacion') v = (v === '' || v === null || v === undefined) ? null : parseFloat(v)
+      if (f === 'nombre') v = String(v || '').trim() || null
+      sets.push(`${f} = $${vals.length + 1}`)
+      vals.push(v)
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'Sin campos para actualizar' })
+    const iEval = vals.length + 1, iRamo = vals.length + 2, iUser = vals.length + 3
+    vals.push(req.params.evalId, req.params.ramoId, req.user.id)
     const { rowCount } = await pool.query(
-      `UPDATE evaluaciones SET nota = $1
-       WHERE id = $2 AND ramo_id = $3
-       AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $4)`,
-      [nota || null, req.params.evalId, req.params.ramoId, req.user.id]
+      `UPDATE evaluaciones SET ${sets.join(', ')}
+       WHERE id = $${iEval} AND ramo_id = $${iRamo}
+       AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $${iUser})`,
+      vals
     )
     if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
     res.json({ ok: true })
   } catch (err) {
-    console.error('Error actualizando nota:', err)
-    res.status(500).json({ error: 'Error al actualizar nota' })
+    console.error('Error actualizando evaluación:', err)
+    res.status(500).json({ error: 'Error al actualizar evaluación' })
   }
 })
 // Mon Apr  6 14:30:49 -04 2026
