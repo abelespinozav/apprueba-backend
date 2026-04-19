@@ -156,8 +156,11 @@ async function extraerContenido(archivo, enviar = () => {}) {
             exitosos++
           } catch(err) {
             console.error(`❌ Chunk ${i+1}/${chunks.length} falló definitivamente (${err.status || err.code || 'error'}): ${err.message}`)
-            const motivo = err.status === 401 ? 'auth' : err.status === 403 ? 'permisos' : 'error'
-            enviar('progreso', { msg: `⚠️ Parte ${i+1} no se pudo transcribir (${motivo}) — continuando con las demás` })
+            if (err.status === 401 || err.status === 403) {
+              enviar('advertencia', { msg: `⚠️ No se pudo transcribir el audio: la clave de OpenAI está rechazando la solicitud (${err.status}). Avisa al administrador — el plan se generará sin este material.` })
+            } else {
+              enviar('advertencia', { msg: `⚠️ Parte ${i+1} no se pudo transcribir (${err.status || err.code || 'error'}) — continuando con las demás` })
+            }
             fallidos++
           }
         }
@@ -310,6 +313,9 @@ async function extraerContenido(archivo, enviar = () => {}) {
       }
     } catch(e) {
       console.error('Error audio Whisper:', e.message)
+      if (e.status === 401 || e.status === 403) {
+        return '(⚠️ No se pudo transcribir este audio: la clave de OpenAI está rechazando las solicitudes de Whisper. Avisa al administrador de APPrueba para revisar la configuración.)'
+      }
       return '(No se pudo transcribir el audio)'
     }
   }
@@ -338,6 +344,9 @@ async function extraerContenido(archivo, enviar = () => {}) {
       }
     } catch(e) {
       console.error('Error video:', e.message)
+      if (e.status === 401 || e.status === 403) {
+        return '(⚠️ No se pudo transcribir este video: la clave de OpenAI está rechazando las solicitudes de Whisper. Avisa al administrador de APPrueba para revisar la configuración.)'
+      }
       return '(No se pudo procesar el video)'
     }
   }
@@ -551,6 +560,9 @@ async function initDB() {
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS guias_tareas JSONB;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS texto_material TEXT;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS plan_generando BOOLEAN DEFAULT false;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS ejercicios_pdf BYTEA;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS ejercicios_pdf_generado_at TIMESTAMP;
+    ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS ejercicios_pdf_tarea_index INTEGER;
     ALTER TABLE quiz_historial ADD COLUMN IF NOT EXISTS evaluacion_id INTEGER;
     ALTER TABLE novedades ADD COLUMN IF NOT EXISTS origen TEXT DEFAULT 'admin';
     ALTER TABLE novedades ADD COLUMN IF NOT EXISTS expira_en TIMESTAMP;
@@ -870,6 +882,70 @@ app.delete('/archivos/:id', authenticateToken, async (req, res) => {
   res.json({ ok: true })
 })
 
+// ── Helpers IA ────────────────────────────────────────────────
+// Contexto del estudiante + ramo para personalizar prompts.
+async function getPerfilEstudiante(evaluacionId) {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.nombre, u.universidad, u.carrera,
+             r.nombre as ramo_nombre, r.min_aprobacion,
+             r.nota_eximicion, r.ponderacion_examen,
+             ROUND(
+               (SUM(e2.nota * e2.ponderacion) / NULLIF(SUM(CASE WHEN e2.nota IS NOT NULL THEN e2.ponderacion END), 0))::numeric
+             , 1) as promedio_actual,
+             COALESCE(SUM(CASE WHEN e2.nota IS NOT NULL THEN e2.ponderacion ELSE 0 END), 0) as ponderacion_usada
+      FROM evaluaciones e
+      JOIN ramos r ON r.id = e.ramo_id
+      JOIN usuarios u ON u.id = r.usuario_id
+      LEFT JOIN evaluaciones e2 ON e2.ramo_id = r.id
+      WHERE e.id = $1
+      GROUP BY u.nombre, u.universidad, u.carrera, r.nombre, r.min_aprobacion, r.nota_eximicion, r.ponderacion_examen
+    `, [evaluacionId])
+    return rows[0] || null
+  } catch (err) {
+    console.error('getPerfilEstudiante:', err.message)
+    return null
+  }
+}
+
+function formatPerfilBloque(perfil) {
+  if (!perfil) return ''
+  const prom = perfil.promedio_actual
+  const promNum = prom != null ? parseFloat(prom) : null
+  const minNum = parseFloat(perfil.min_aprobacion)
+  const critico = promNum != null && promNum < minNum
+  const uni = perfil.universidad || 'universidad chilena'
+  return [
+    'PERFIL DEL ESTUDIANTE:',
+    `- Nombre: ${perfil.nombre || 'estudiante'}`,
+    `- Universidad: ${uni}`,
+    `- Carrera: ${perfil.carrera || 'no especificada'}`,
+    `- Ramo: ${perfil.ramo_nombre}`,
+    `- Promedio actual en el ramo: ${promNum != null ? promNum.toFixed(1) : 'sin notas aún'}`,
+    `- Ponderación evaluada hasta ahora: ${perfil.ponderacion_usada || 0}%`,
+    `- Nota mínima para aprobar: ${perfil.min_aprobacion}`,
+    `- Situación: ${critico ? '⚠️ CRÍTICA — el estudiante está bajo el mínimo, necesita recuperarse' : 'va bien en el ramo'}`
+  ].join('\n')
+}
+
+// Retry con backoff para llamadas gpt-4o chat completions. Bail inmediato
+// en 401/403 (no tiene sentido reintentar con credenciales rotas).
+async function callOpenAIWithRetry(params, maxRetries = 2) {
+  let lastErr
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await openaiClient.chat.completions.create(params)
+    } catch (err) {
+      lastErr = err
+      if (err.status === 401 || err.status === 403) throw err
+      if (attempt === maxRetries) throw err
+      console.warn(`OpenAI retry ${attempt}/${maxRetries}: ${err.message}`)
+      await new Promise(r => setTimeout(r, 1500 * attempt))
+    }
+  }
+  throw lastErr
+}
+
 // Generar plan de estudio con IA
 app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('archivo', 10), async (req, res) => {
   // Configurar SSE
@@ -1027,9 +1103,13 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
       enviar('progreso', { msg: `⚠️ No se pudo leer: ${archivosConError.join(', ')}. Continuando con el resto del material...` })
     }
 
-    const promptFinal = textoArchivos 
+    // Contexto del estudiante para personalizar el plan
+    const perfil = await getPerfilEstudiante(evalId)
+    const perfilBloque = formatPerfilBloque(perfil)
+
+    const promptFinal = (perfilBloque ? perfilBloque + '\n\n' : '') + (textoArchivos
       ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- NUNCA rechaces el material ni sugieras buscar otro. Usa lo que hay.`
-      : promptText
+      : promptText)
 
     // Marcar como generando en DB
     await pool.query('UPDATE evaluaciones SET plan_generando = TRUE WHERE id = $1', [evalId])
@@ -2541,16 +2621,18 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el podcast.' })
     }
     const plan = ev.plan_estudio ? JSON.stringify(ev.plan_estudio) : ''
-    const guionRes = await openai.chat.completions.create({
+    const perfil = await getPerfilEstudiante(evId)
+    const perfilBloque = formatPerfilBloque(perfil)
+    const guionRes = await callOpenAIWithRetry({
       model: 'gpt-4o',
       messages: [{
         role: 'system',
         content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Constanza" (profesora entusiasta y experta) y "Benjamín" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 7 minutos. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "constanza"|"benjamin", "texto": "..." }] }. Mínimo 28 segmentos, máximo 35. Cada segmento debe tener 2-3 oraciones completas. Estructura: introducción motivadora (5 seg), desarrollo profundo por subtemas con ejemplos reales (45 seg), preguntas y respuestas entre Constanza y Benjamín (8 seg), conclusión y consejos para el examen (4 seg). Habla de forma MUY NATURAL como un podcast real. NUNCA uses el nombre del interlocutor para dirigirte a él/ella (nada de "así es Benjamín", "gracias Constanza", "qué buena pregunta"). Las transiciones deben ser naturales: "exacto", "claro", "mira", "lo que pasa es que...", "y ahí está la clave". Usa analogías, ejemplos cotidianos y humor ocasional.'
       }, {
         role: 'user',
-        content: material
+        content: (perfilBloque ? perfilBloque + '\n\n' : '') + (material
         ? 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 15000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener entre 28 y 35 segmentos, cada uno con 2-3 oraciones. Sé conciso pero claro.'
-        : 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Entre 28 y 35 segmentos, cada uno con 2-3 oraciones.'
+        : 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Entre 28 y 35 segmentos, cada uno con 2-3 oraciones.')
       }],
       response_format: { type: 'json_object' }
     })
@@ -2654,9 +2736,12 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
       contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${ev.texto_material.slice(0, 15000)}`
     }
 
+    const perfilGuia = await getPerfilEstudiante(req.params.id)
+    const perfilBloqueGuia = formatPerfilBloque(perfilGuia)
+
     const prompt = `Eres el mejor tutor universitario del mundo — un experto que combina la claridad de Richard Feynman, la pedagogía de un profesor que realmente se preocupa por sus estudiantes, y la capacidad de hacer que cualquier tema sea fascinante. Tu misión es generar una guía de estudio TAN BUENA que el estudiante diga "¡WOW, esto es espectacular!".
 
-Ramo: ${ev.ramo_nombre}
+${perfilBloqueGuia ? perfilBloqueGuia + '\n\n' : ''}Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
 Tarea a estudiar: ${tarea.titulo}
 Descripción: ${tarea.descripcion}${contenidoArchivos}
@@ -2690,7 +2775,7 @@ Responde SOLO con un JSON válido (sin markdown, sin bloques de código):
 
 Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con insights, y 3 ejercicios de práctica (uno básico, uno intermedio, uno avanzado).`
 
-    const result = await openai.chat.completions.create({
+    const result = await callOpenAIWithRetry({
       model: 'gpt-4o',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.7
@@ -2884,9 +2969,11 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
           return
         }
         enviar('progreso', { msg: '🤖 Generando 20 preguntas con IA...' })
+        const perfilQuiz = await getPerfilEstudiante(evalId)
+        const perfilBloqueQuiz = formatPerfilBloque(perfilQuiz)
         const prompt = `Eres un profesor universitario experto en ${ev.ramo_nombre}. Tu tarea es crear un quiz que evalúe si el estudiante ENTIENDE y SABE APLICAR los conceptos del material, NO que recuerde cómo está organizado el documento.
 
-Ramo: ${ev.ramo_nombre}
+${perfilBloqueQuiz ? perfilBloqueQuiz + '\n\n' : ''}Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
 
 MATERIAL DE ESTUDIO:
@@ -2910,7 +2997,7 @@ INSTRUCCIONES CRÍTICAS:
 Formato:
 {"preguntas":[{"id":1,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"C","explicacion":"...","dificultad":"facil"},{"id":2,"pregunta":"...","alternativas":{"A":"...","B":"...","C":"...","D":"..."},"correcta":"B","explicacion":"...","dificultad":"media"}]}
 IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C y D. NO pongas siempre A como correcta.`
-        const result = await openai.chat.completions.create({
+        const result = await callOpenAIWithRetry({
           model: 'gpt-4o',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.7
@@ -2963,7 +3050,7 @@ const PDFDocument = require('pdfkit')
 
 app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res) => {
   try {
-    const { tarea, tareaIndex } = req.body
+    const { tarea, tareaIndex, forzar } = req.body
     const evRes = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre FROM evaluaciones e
        JOIN ramos r ON e.ramo_id = r.id
@@ -2973,6 +3060,20 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
     if (evRes.rows.length === 0) return res.status(404).json({ error: 'No encontrada' })
     const ev = evRes.rows[0]
 
+    // CACHE: si hay PDF del mismo día para esta misma tarea, servirlo sin regenerar
+    if (!forzar && ev.ejercicios_pdf && ev.ejercicios_pdf_generado_at &&
+        ev.ejercicios_pdf_tarea_index === tareaIndex) {
+      const generado = new Date(ev.ejercicios_pdf_generado_at)
+      const hoy = new Date()
+      const mismoDia = generado.toDateString() === hoy.toDateString()
+      if (mismoDia) {
+        res.setHeader('Content-Type', 'application/pdf')
+        res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
+        res.setHeader('X-Cached', '1')
+        return res.send(Buffer.isBuffer(ev.ejercicios_pdf) ? ev.ejercicios_pdf : Buffer.from(ev.ejercicios_pdf))
+      }
+    }
+
     // BLOQUEO: límite ejercicios
     const ejerciciosRes = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
     const ejerciciosUsados = ejerciciosRes.rows[0]?.ejercicios_usados || 0
@@ -2980,11 +3081,18 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
     const limiteGlobalE = limiteResE.rows.length ? parseInt(limiteResE.rows[0].valor) : 100
     if (ejerciciosUsados >= limiteGlobalE) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados, limite: limiteGlobalE })
 
-    const completion = await openai.chat.completions.create({
+    const perfilEj = await getPerfilEstudiante(req.params.id)
+    const perfilBloqueEj = formatPerfilBloque(perfilEj)
+    const materialEj = (ev.texto_material || '').slice(0, 10000)
+    const materialBloque = materialEj
+      ? `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (basa los ejercicios en este contenido real):\n${materialEj}`
+      : ''
+
+    const completion = await callOpenAIWithRetry({
       model: 'gpt-4o',
-      messages: [{ role: 'user', content: `Eres un profesor universitario experto en "${ev.ramo_nombre}".
+      messages: [{ role: 'user', content: `${perfilBloqueEj ? perfilBloqueEj + '\n\n' : ''}Eres un profesor universitario experto en "${ev.ramo_nombre}".
 Genera exactamente 20 ejercicios sobre el tema: "${tarea.titulo}".
-Contexto: ${tarea.descripcion}
+Contexto: ${tarea.descripcion}${materialBloque}
 
 - Ejercicios 1-7: FÁCILES (conceptos básicos)
 - Ejercicios 8-14: MEDIOS (aplicación)
@@ -3000,10 +3108,21 @@ Responde SOLO con JSON válido:
     const ejercicios = data.ejercicios || []
 
     const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true })
-    res.setHeader('Content-Type', 'application/pdf')
-    res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
-    await pool.query('UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1', [req.user.id])
-    doc.pipe(res)
+    const chunks = []
+    doc.on('data', c => chunks.push(c))
+    doc.on('end', async () => {
+      const pdfBuf = Buffer.concat(chunks)
+      try {
+        await pool.query(
+          'UPDATE evaluaciones SET ejercicios_pdf = $1, ejercicios_pdf_generado_at = NOW(), ejercicios_pdf_tarea_index = $2 WHERE id = $3',
+          [pdfBuf, tareaIndex, req.params.id]
+        )
+        await pool.query('UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1', [req.user.id])
+      } catch(err) { console.error('Error cacheando PDF ejercicios:', err.message) }
+      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
+      res.send(pdfBuf)
+    })
 
     // ── Colores (fondo blanco) ────────────────────────────────────
     const ACCENT   = '#6c63ff'
