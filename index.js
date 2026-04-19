@@ -1341,8 +1341,9 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
   bot.on('photo', async (msg) => {
     const chatId = msg.chat.id
     const userId = msg.from?.id
+    console.log(`📸 Telegram photo recibida · from.id=${userId} · username=${msg.from?.username || '—'} · allowed=${telegramAllowlist.has(userId)}`)
     if (!telegramAllowlist.has(userId)) {
-      try { await bot.sendMessage(chatId, '🚫 No estás en la lista de usuarios autorizados.') } catch(_) {}
+      try { await bot.sendMessage(chatId, `🚫 No autorizado. Tu user ID es: ${userId}`) } catch(_) {}
       return
     }
     try {
