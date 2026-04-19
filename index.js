@@ -1232,14 +1232,42 @@ async function scrapeUfroNovedades() {
     return items
   })
 
-  const results = await Promise.allSettled([wp, agenda, dde])
-  const labels = ['WP REST', 'Agenda', 'DDE']
+  // JUNAEB · WP REST abierto. Filtra por keyword relevante a universitarios
+  // y descarta posts con más de 45 días. Máximo 2 items.
+  const junaeb = axios.get(
+    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
+    { timeout: 8000, headers: ua }
+  ).then(({ data: posts }) => {
+    const items = []
+    const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
+    const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
+    const now = Date.now()
+    for (const post of posts) {
+      if (items.length >= 2) break
+      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+      if (!titulo || !RELEVANTE.test(titulo)) continue
+      const fechaMs = post.date ? new Date(post.date).getTime() : 0
+      if (!fechaMs || now - fechaMs > DIAS_45_MS) continue
+      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+      items.push({
+        tipo: 'Beneficio', emoji: '💳',
+        titulo: titulo.slice(0, 75),
+        descripcion: desc ? desc.slice(0, 70) : 'JUNAEB · anuncio nacional',
+        color: '#fbbf24',
+        link: post.link
+      })
+    }
+    return items
+  })
+
+  const results = await Promise.allSettled([wp, agenda, dde, junaeb])
+  const labels = ['WP REST', 'Agenda', 'DDE', 'JUNAEB']
   const novedades = []
   results.forEach((r, i) => {
     if (r.status === 'fulfilled') novedades.push(...r.value)
     else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
   })
-  return novedades.slice(0, 6)
+  return novedades.slice(0, 8)
 }
 
 // Cron: cada 2h refresca tabla novedades con el scrape UFRO.
