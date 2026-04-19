@@ -661,32 +661,14 @@ app.get('/auth/google/callback',
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     )
-    res.cookie('auth_bridge', token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      maxAge: 60_000
-    })
-    res.redirect(`${process.env.CLIENT_URL}?auth=success`)
+    // Redirigimos con el JWT en el fragment (hash). El fragment no viaja al
+    // servidor → no aparece en logs de Railway/CDN ni en access logs. Resuelve
+    // el bloqueo de third-party cookies de browsers modernos (Safari ITP,
+    // Chrome Privacy Sandbox, Firefox ETP) que impedía usar cookies entre los
+    // subdominios apprueba-production.up.railway.app y apprueba-backend-...
+    res.redirect(`${process.env.CLIENT_URL}/#auth_token=${encodeURIComponent(token)}`)
   }
 )
-
-app.post('/auth/exchange', async (req, res) => {
-  const token = req.cookies.auth_bridge
-  if (!token) return res.status(401).json({ error: 'No hay cookie de autenticación' })
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET)
-    const { rows } = await pool.query(
-      'SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1',
-      [decoded.id]
-    )
-    if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
-    res.clearCookie('auth_bridge', { httpOnly: true, secure: true, sameSite: 'none' })
-    res.json({ token, usuario: rows[0] })
-  } catch {
-    res.status(401).json({ error: 'Token inválido' })
-  }
-})
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
   const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
