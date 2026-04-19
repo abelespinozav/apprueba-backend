@@ -1363,11 +1363,18 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 
   // Preview pendiente de confirmación por chat. TTL 10 min.
   const pendingCasino = new Map() // chatId -> { titulo, descripcion, createdAt }
+  const descuentoDraft = new Map() // chatId -> { step, titulo, descripcion, createdAt }
   const PENDING_TTL_MS = 10 * 60 * 1000
   function getPendingCasino(chatId) {
     const e = pendingCasino.get(chatId)
     if (!e) return null
     if (Date.now() - e.createdAt > PENDING_TTL_MS) { pendingCasino.delete(chatId); return null }
+    return e
+  }
+  function getDescuentoDraft(chatId) {
+    const e = descuentoDraft.get(chatId)
+    if (!e) return null
+    if (Date.now() - e.createdAt > PENDING_TTL_MS) { descuentoDraft.delete(chatId); return null }
     return e
   }
 
@@ -1457,62 +1464,166 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     }
   })
 
-  // Callback de los botones inline (publicar / cancelar el preview)
+  // Comando /descuento · flujo conversacional 2 pasos (nombre → descripción)
+  bot.onText(/^\/descuento\b/, async (msg) => {
+    const chatId = msg.chat.id
+    const userId = msg.from?.id
+    if (!telegramAllowlist.has(userId)) {
+      try { await bot.sendMessage(chatId, `🚫 No autorizado. Tu user ID es: ${userId}`) } catch(_) {}
+      return
+    }
+    descuentoDraft.set(chatId, { step: 'titulo', titulo: '', descripcion: '', createdAt: Date.now() })
+    await bot.sendMessage(chatId,
+      '💸 *Nuevo descuento*\n\n¿Cómo se llama el lugar o negocio?\n\n_(envía /cancelar para abortar)_',
+      { parse_mode: 'Markdown' }
+    )
+  })
+
+  bot.onText(/^\/cancelar\b/, async (msg) => {
+    const chatId = msg.chat.id
+    if (descuentoDraft.has(chatId)) {
+      descuentoDraft.delete(chatId)
+      try { await bot.sendMessage(chatId, '✖️ Descuento descartado.') } catch(_) {}
+    }
+  })
+
+  // Captura texto libre cuando hay un draft de descuento activo
+  bot.on('message', async (msg) => {
+    if (msg.photo) return                           // lo maneja el handler 'photo'
+    if (!msg.text || msg.text.startsWith('/')) return // ignorar comandos
+    const chatId = msg.chat.id
+    const userId = msg.from?.id
+    if (!telegramAllowlist.has(userId)) return
+    const draft = getDescuentoDraft(chatId)
+    if (!draft) return
+
+    if (draft.step === 'titulo') {
+      draft.titulo = msg.text.trim().slice(0, 80)
+      draft.step = 'descripcion'
+      try {
+        await bot.sendMessage(chatId,
+          '💸 ¿Qué descuento o promo ofrece?\n_(ej: "20% con TNE", "2x1 los miércoles", "Menú estudiantil $3.500")_',
+          { parse_mode: 'Markdown' }
+        )
+      } catch(_) {}
+      return
+    }
+
+    if (draft.step === 'descripcion') {
+      draft.descripcion = msg.text.trim().slice(0, 200)
+      draft.step = 'preview'
+      try {
+        await bot.sendMessage(chatId,
+          `📋 *Preview del descuento:*\n\n💸 *${draft.titulo}*\n${draft.descripcion}\n\n¿Publicar en Apprueba?`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '✅ Publicar', callback_data: 'descuento_publish' },
+                { text: '❌ Cancelar', callback_data: 'descuento_cancel' }
+              ]]
+            }
+          }
+        )
+      } catch(_) {}
+    }
+  })
+
+  // Callback de los botones inline · dispatch por prefijo de `data`
   bot.on('callback_query', async (query) => {
     const chatId = query.message?.chat?.id
     const messageId = query.message?.message_id
     const userId = query.from?.id
-    const data = query.data
+    const data = query.data || ''
 
     if (!telegramAllowlist.has(userId)) {
       try { await bot.answerCallbackQuery(query.id, { text: '🚫 No autorizado' }) } catch(_) {}
       return
     }
 
-    const pending = getPendingCasino(chatId)
-    if (!pending) {
-      try {
-        await bot.answerCallbackQuery(query.id, { text: 'No hay menú pendiente (expiró o ya fue procesado)' })
-        if (messageId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
-      } catch(_) {}
-      return
-    }
-
-    if (data === 'casino_cancel') {
-      pendingCasino.delete(chatId)
-      try {
-        await bot.answerCallbackQuery(query.id, { text: 'Cancelado' })
-        await bot.editMessageText('❌ Cancelado, no se publicó nada.', { chat_id: chatId, message_id: messageId })
-      } catch(_) {}
-      return
-    }
-
-    if (data === 'casino_publish') {
-      try {
-        // Dedupe: borra el menú de HOY (Santiago) si ya existía
-        await pool.query(`
-          DELETE FROM novedades
-          WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
-            AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
-        `)
-        // Insert con expira_en = medianoche de HOY Santiago
-        await pool.query(`
-          INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
-          VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
-            (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
-        `, [pending.titulo, pending.descripcion])
-        novedadesCache.delete('ufro')
+    // ── Casino ──
+    if (data.startsWith('casino_')) {
+      const pending = getPendingCasino(chatId)
+      if (!pending) {
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'No hay menú pendiente (expiró o ya fue procesado)' })
+          if (messageId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
+        } catch(_) {}
+        return
+      }
+      if (data === 'casino_cancel') {
         pendingCasino.delete(chatId)
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'Cancelado' })
+          await bot.editMessageText('❌ Cancelado, no se publicó nada.', { chat_id: chatId, message_id: messageId })
+        } catch(_) {}
+        return
+      }
+      if (data === 'casino_publish') {
+        try {
+          await pool.query(`
+            DELETE FROM novedades
+            WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
+              AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
+          `)
+          await pool.query(`
+            INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
+            VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
+              (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
+          `, [pending.titulo, pending.descripcion])
+          novedadesCache.delete('ufro')
+          pendingCasino.delete(chatId)
+          await bot.answerCallbackQuery(query.id, { text: '✅ Publicado' })
+          await bot.editMessageText(
+            `✅ Menú publicado en Apprueba · caduca a medianoche.\n\n${pending.descripcion}`,
+            { chat_id: chatId, message_id: messageId }
+          )
+        } catch (err) {
+          console.error('❌ Bot Telegram (casino publish):', err.message)
+          try { await bot.answerCallbackQuery(query.id, { text: 'Error al guardar' }) } catch(_) {}
+          try { await bot.sendMessage(chatId, `⚠️ Error: ${err.message}`) } catch(_) {}
+        }
+      }
+      return
+    }
 
-        await bot.answerCallbackQuery(query.id, { text: '✅ Publicado' })
-        await bot.editMessageText(
-          `✅ Menú publicado en Apprueba · caduca a medianoche.\n\n${pending.descripcion}`,
-          { chat_id: chatId, message_id: messageId }
-        )
-      } catch (err) {
-        console.error('❌ Bot Telegram (callback publish):', err.message)
-        try { await bot.answerCallbackQuery(query.id, { text: 'Error al guardar' }) } catch(_) {}
-        try { await bot.sendMessage(chatId, `⚠️ Error: ${err.message}`) } catch(_) {}
+    // ── Descuento ──
+    if (data.startsWith('descuento_')) {
+      const draft = getDescuentoDraft(chatId)
+      if (!draft) {
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'No hay descuento pendiente (expiró o ya fue procesado)' })
+          if (messageId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
+        } catch(_) {}
+        return
+      }
+      if (data === 'descuento_cancel') {
+        descuentoDraft.delete(chatId)
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'Cancelado' })
+          await bot.editMessageText('❌ Descuento descartado.', { chat_id: chatId, message_id: messageId })
+        } catch(_) {}
+        return
+      }
+      if (data === 'descuento_publish') {
+        try {
+          const tituloFinal = `💸 ${draft.titulo}`.slice(0, 100)
+          await pool.query(`
+            INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen)
+            VALUES ('ufro', 'Descuento', '💸', $1, $2, '#10b981', 'telegram')
+          `, [tituloFinal, draft.descripcion])
+          novedadesCache.delete('ufro')
+          descuentoDraft.delete(chatId)
+          await bot.answerCallbackQuery(query.id, { text: '✅ Publicado' })
+          await bot.editMessageText(
+            `✅ Descuento publicado en Apprueba.\n\n💸 *${draft.titulo}*\n${draft.descripcion}`,
+            { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
+          )
+        } catch (err) {
+          console.error('❌ Bot Telegram (descuento publish):', err.message)
+          try { await bot.answerCallbackQuery(query.id, { text: 'Error al guardar' }) } catch(_) {}
+          try { await bot.sendMessage(chatId, `⚠️ Error: ${err.message}`) } catch(_) {}
+        }
       }
     }
   })
