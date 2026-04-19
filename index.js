@@ -1975,16 +1975,26 @@ app.get('/admin/telegram/status', authenticateToken, requireAdmin, async (req, r
   try {
     const activo = !!process.env.TELEGRAM_BOT_TOKEN
     const allowlist = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
-    const { rows } = await pool.query(
-      "SELECT COUNT(*) as total FROM novedades WHERE origen = 'telegram'"
+    const countRes = await pool.query("SELECT COUNT(*) as total FROM novedades WHERE origen = 'telegram'")
+    const ultimasRes = await pool.query(
+      "SELECT id, tipo, emoji, titulo, creada_en FROM novedades WHERE origen = 'telegram' ORDER BY creada_en DESC LIMIT 5"
     )
+    // Siempre responder con shape completa (arrays vacíos, no null) para que
+    // el frontend no tenga que defender contra undefined en cada campo.
     res.json({
       activo,
-      username: process.env.TELEGRAM_BOT_USERNAME || null,
-      total_publicaciones: parseInt(rows[0].total) || 0,
-      allowlist
+      username: process.env.TELEGRAM_BOT_USERNAME || 'apprueba_bot',
+      total_publicaciones: parseInt(countRes.rows[0].total) || 0,
+      allowlist: allowlist || [],
+      ultimas_publicaciones: ultimasRes.rows || []
     })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    // En error devuelvo shape completa con defaults para que el UI no crashee
+    res.status(500).json({
+      activo: false, username: '', total_publicaciones: 0,
+      allowlist: [], ultimas_publicaciones: [], error: err.message
+    })
+  }
 })
 
 // Todas las novedades (incluyendo expiradas) para el panel admin
