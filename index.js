@@ -552,6 +552,8 @@ async function initDB() {
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS texto_material TEXT;
     ALTER TABLE evaluaciones ADD COLUMN IF NOT EXISTS plan_generando BOOLEAN DEFAULT false;
     ALTER TABLE quiz_historial ADD COLUMN IF NOT EXISTS evaluacion_id INTEGER;
+    ALTER TABLE novedades ADD COLUMN IF NOT EXISTS origen TEXT DEFAULT 'admin';
+    ALTER TABLE novedades ADD COLUMN IF NOT EXISTS expira_en TIMESTAMP;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
   console.log('Base de datos lista ✅')
@@ -1145,109 +1147,148 @@ initDB().then(() => {
 
 
 // ── NOVEDADES ─────────────────────────────────────────────────────
+// ── NOVEDADES · cache + scraping UFRO ─────────────────────────────
+const NOVEDADES_CACHE_TTL_MS = 2 * 60 * 60 * 1000 // 2h
+const novedadesCache = new Map() // universidad -> { timestamp, data }
+
+function getCachedNovedades(uni) {
+  const entry = novedadesCache.get(uni)
+  if (!entry) return null
+  if (Date.now() - entry.timestamp > NOVEDADES_CACHE_TTL_MS) return null
+  return entry.data
+}
+function setCachedNovedades(uni, data) {
+  novedadesCache.set(uni, { timestamp: Date.now(), data })
+}
+
+// Scrape UFRO en paralelo (3 fuentes con Promise.allSettled).
+// Worst-case ≈ timeout más largo (DDE, 15s) en vez de la suma (28s).
+async function scrapeUfroNovedades() {
+  const axios = require('axios')
+  const cheerio = require('cheerio')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const wp = axios.get(
+    'https://www.ufro.cl/wp-json/wp/v2/posts?per_page=4&_fields=title,excerpt,date,link',
+    { timeout: 8000, headers: ua }
+  ).then(({ data: posts }) => {
+    const items = []
+    for (const post of posts) {
+      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+      if (titulo) items.push({ tipo: 'Noticia', emoji: '📰', titulo: titulo.slice(0, 75), descripcion: desc ? desc.slice(0, 70) : 'UFRO al día', color: '#60a5fa', link: post.link })
+    }
+    return items
+  })
+
+  const agenda = axios.get(
+    'https://www.ufro.cl/agenda/',
+    { timeout: 5000, headers: ua }
+  ).then(({ data: agendaHtml }) => {
+    const $a = cheerio.load(agendaHtml)
+    const eventosVistos = new Set()
+    const items = []
+    $a('.entry-content li, article h2, .agenda h2, main h2').each((i, el) => {
+      if (eventosVistos.size >= 3) return
+      const titulo = $a(el).text().trim()
+      const fecha = $a(el).next().text().trim().replace(/\n/g,' ').slice(0,40)
+      if (titulo && titulo.length > 10 && titulo.length < 120 && !eventosVistos.has(titulo)) {
+        eventosVistos.add(titulo)
+        items.push({ tipo: 'Evento', emoji: '📅', titulo: titulo.slice(0, 75), descripcion: fecha || 'Ver agenda UFRO', color: '#a78bfa', link: 'https://www.ufro.cl/agenda/' })
+      }
+    })
+    if (eventosVistos.size === 0) {
+      const h2regex = new RegExp('<h2[^>]*>([^<]{10,100})<\/h2>', 'g')
+      const navWords = ['Institucional','Organización','Facultades','Pregrado','Postgrado','Investigación','Vinculación','Internacionalización','Educación']
+      let match
+      while ((match = h2regex.exec(agendaHtml)) !== null) {
+        if (eventosVistos.size >= 3) break
+        const titulo = match[1].trim()
+        if (navWords.every(w => titulo.indexOf(w) === -1) && titulo.length > 10) {
+          eventosVistos.add(titulo)
+          items.push({ tipo: 'Evento', emoji: '📅', titulo: titulo.slice(0, 75), descripcion: 'Ver agenda UFRO', color: '#a78bfa', link: 'https://www.ufro.cl/agenda/' })
+        }
+      }
+    }
+    return items
+  })
+
+  const dde = axios.get(
+    'https://dde.ufro.cl/noticias/',
+    { timeout: 15000, headers: ua }
+  ).then(({ data: ddeHtml }) => {
+    const $d = cheerio.load(ddeHtml)
+    const items = []
+    let ddeCount = 0
+    $d('a').each((i, el) => {
+      if (ddeCount >= 2) return
+      const titulo = $d(el).text().trim().replace(/\s+/g, ' ')
+      const href = $d(el).attr('href') || ''
+      if (titulo && titulo.length > 15 && titulo.length < 150 && href && href !== 'https://dde.ufro.cl/noticias/') {
+        items.push({ tipo: 'Vida Estudiantil', emoji: '🎓', titulo: titulo.slice(0, 75), descripcion: 'DDE · Desarrollo Estudiantil UFRO', color: '#34d399', link: href })
+        ddeCount++
+      }
+    })
+    return items
+  })
+
+  const results = await Promise.allSettled([wp, agenda, dde])
+  const labels = ['WP REST', 'Agenda', 'DDE']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 6)
+}
+
+// Cron: cada 2h refresca tabla novedades con el scrape UFRO.
+// Borra solo rows origen='scrape' para no tocar las entradas admin.
+async function refrescarNovedadesUfro() {
+  try {
+    const items = await scrapeUfroNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'ufro' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('ufro', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('ufro', items)
+    console.log(`📰 Novedades UFRO refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades UFRO:', err.message)
+  }
+}
+
+cron.schedule('0 */2 * * *', refrescarNovedadesUfro, { timezone: 'America/Santiago' })
+
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
     const { universidad } = req.query
     const uni = universidad || 'ufro'
     const { rows } = await pool.query(
-      'SELECT * FROM novedades WHERE universidad = $1 AND activa = true ORDER BY creada_en DESC',
+      `SELECT * FROM novedades
+       WHERE universidad = $1 AND activa = true
+         AND (expira_en IS NULL OR expira_en > NOW())
+       ORDER BY creada_en DESC`,
       [uni]
     )
     if (rows.length > 0) return res.json(rows)
 
-    // Fallback: WordPress REST API de UFRO
+    // Fallback live solo para UFRO (con cache en memoria de 2h)
     if (uni === 'ufro') {
+      const cached = getCachedNovedades(uni)
+      if (cached) return res.json(cached)
+
       try {
-        const axios = require('axios')
-        const novedades = []
-
-        // Noticias via WP API
-        const { data: posts } = await axios.get(
-          'https://www.ufro.cl/wp-json/wp/v2/posts?per_page=4&_fields=title,excerpt,date,link',
-          { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-        )
-        for (const post of posts) {
-          const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
-          const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
-          if (titulo) novedades.push({ tipo: 'Noticia', emoji: '📰', titulo: titulo.slice(0, 75), descripcion: desc ? desc.slice(0, 70) : "UFRO al día", color: '#60a5fa', link: post.link })
+        const novedades = await scrapeUfroNovedades()
+        if (novedades.length > 0) {
+          setCachedNovedades(uni, novedades)
+          return res.json(novedades)
         }
-
-        // Eventos via scraping de /agenda/
-        try {
-          const { data: agendaHtml } = await axios.get(
-            'https://www.ufro.cl/agenda/',
-            { timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-          )
-          const cheerio = require('cheerio')
-          const $a = cheerio.load(agendaHtml)
-          const eventosVistos = new Set()
-          // Buscar artículos o entradas de agenda en el contenido principal
-          // Los eventos en UFRO aparecen como li con fecha debajo de h2
-          $a('.entry-content li, article h2, .agenda h2, main h2').each((i, el) => {
-            if (eventosVistos.size >= 3) return
-            const titulo = $a(el).text().trim()
-            const fecha = $a(el).next().text().trim().replace(/\n/g,' ').slice(0,40)
-            if (titulo && titulo.length > 10 && titulo.length < 120 && !eventosVistos.has(titulo)) {
-              eventosVistos.add(titulo)
-              novedades.push({
-                tipo: 'Evento', emoji: '📅',
-                titulo: titulo.slice(0, 75),
-                descripcion: fecha || 'Ver agenda UFRO',
-                color: '#a78bfa',
-                link: 'https://www.ufro.cl/agenda/'
-              })
-            }
-          })
-          // Fallback: parsear h2 del HTML como string
-          if (eventosVistos.size === 0) {
-            const h2regex = new RegExp('<h2[^>]*>([^<]{10,100})<\/h2>', 'g')
-            const navWords = ['Institucional','Organización','Facultades','Pregrado','Postgrado','Investigación','Vinculación','Internacionalización','Educación']
-            let match
-            while ((match = h2regex.exec(agendaHtml)) !== null) {
-              if (eventosVistos.size >= 3) break
-              const titulo = match[1].trim()
-              if (navWords.every(w => titulo.indexOf(w) === -1) && titulo.length > 10) {
-                eventosVistos.add(titulo)
-                novedades.push({
-                  tipo: 'Evento', emoji: '📅',
-                  titulo: titulo.slice(0, 75),
-                  descripcion: 'Ver agenda UFRO',
-                  color: '#a78bfa',
-                  link: 'https://www.ufro.cl/agenda/'
-                })
-              }
-            }
-          }
-        } catch(e) { console.log('Agenda scraping falló:', e.message) }
-
-        // Noticias DDE (Desarrollo Estudiantil)
-        try {
-          const { data: ddeHtml } = await axios.get(
-            'https://dde.ufro.cl/noticias/',
-            { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-          )
-          const cheerio2 = require('cheerio')
-          const $d = cheerio2.load(ddeHtml)
-          let ddeCount = 0
-          $d('a').each((i, el) => {
-            if (ddeCount >= 2) return
-            const titulo = $d(el).text().trim().replace(/\s+/g, ' ')
-            const href = $d(el).attr('href') || ''
-            if (titulo && titulo.length > 15 && titulo.length < 150 && href && href !== 'https://dde.ufro.cl/noticias/') {
-              novedades.push({
-                tipo: 'Vida Estudiantil', emoji: '🎓',
-                titulo: titulo.slice(0, 75),
-                descripcion: 'DDE · Desarrollo Estudiantil UFRO',
-                color: '#34d399',
-                link: href
-              })
-              ddeCount++
-            }
-          })
-        } catch(e) { console.log('DDE scraping falló:', e.message) }
-
-        if (novedades.length > 0) return res.json(novedades.slice(0, 6))
-      } catch(scrapeErr) {
+      } catch (scrapeErr) {
         console.log('API UFRO falló:', scrapeErr.message)
       }
     }
@@ -1273,6 +1314,132 @@ app.delete('/novedades/:id', authenticateToken, async (req, res) => {
     res.json({ ok: true })
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
+
+// ── TELEGRAM BOT · menú casino UFRO ──────────────────────────────
+// Activado solo si TELEGRAM_BOT_TOKEN está definida. Arquitectura webhook:
+// Telegram → POST /telegram/webhook → bot.processUpdate → handler 'photo'.
+// Seguridad: secret header + allowlist de user IDs.
+if (process.env.TELEGRAM_BOT_TOKEN) {
+  const TelegramBot = require('node-telegram-bot-api')
+  const axios = require('axios')
+  const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
+
+  const telegramAllowlist = new Set(
+    (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
+      .split(',')
+      .map(s => parseInt(s.trim(), 10))
+      .filter(Number.isFinite)
+  )
+
+  const CASINO_PROMPT = 'Esta es una foto del menú del casino de la UFRO de hoy. '
+    + 'Extrae los platos del día (entrada, plato de fondo, acompañamiento, postre, y vegetariano si aparece). '
+    + 'Devuelve SOLO un JSON con la forma: '
+    + '{"platos":["Entrada: ...","Fondo: ...","Acompañamiento: ...","Postre: ...","Vegetariano: ..."],"destacado":"Plato estrella del día"}. '
+    + 'Si algún campo no aparece, omítelo del arreglo. '
+    + 'Si la imagen NO es un menú de casino, devuelve {"platos":[],"destacado":""}.'
+
+  bot.on('photo', async (msg) => {
+    const chatId = msg.chat.id
+    const userId = msg.from?.id
+    if (!telegramAllowlist.has(userId)) {
+      try { await bot.sendMessage(chatId, '🚫 No estás en la lista de usuarios autorizados.') } catch(_) {}
+      return
+    }
+    try {
+      const photo = msg.photo[msg.photo.length - 1] // el más grande
+      if (photo.file_size && photo.file_size > 20 * 1024 * 1024) {
+        await bot.sendMessage(chatId, '📏 Imagen muy grande (>20 MB). Reenvía comprimida.')
+        return
+      }
+      await bot.sendMessage(chatId, '👀 Procesando menú del casino...')
+
+      const fileLink = await bot.getFileLink(photo.file_id)
+      const { data: imgBuffer } = await axios.get(fileLink, { responseType: 'arraybuffer', timeout: 20000 })
+
+      // Re-comprimir con sharp para ahorrar tokens Vision
+      const compressed = await sharp(imgBuffer)
+        .rotate()
+        .resize({ width: 1400, withoutEnlargement: true })
+        .jpeg({ quality: 80 })
+        .toBuffer()
+      const base64 = compressed.toString('base64')
+
+      const visionResp = await openaiClient.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: CASINO_PROMPT },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'high' } }
+        ]}],
+        max_tokens: 600,
+        response_format: { type: 'json_object' }
+      })
+
+      const raw = visionResp.choices[0].message.content
+      let parsed
+      try { parsed = JSON.parse(raw) } catch (_) { parsed = { platos: [], destacado: '' } }
+
+      if (!Array.isArray(parsed.platos) || parsed.platos.length === 0) {
+        await bot.sendMessage(chatId, '🤔 No detecté platos en esta imagen. ¿Es realmente el menú del casino?')
+        return
+      }
+
+      const descripcion = parsed.platos.join(' · ').slice(0, 500)
+      const titulo = parsed.destacado
+        ? `🍽️ Menú · ${String(parsed.destacado).slice(0, 60)}`
+        : '🍽️ Menú del casino hoy'
+
+      // Dedupe: borra el menú de HOY (Santiago) si ya existía
+      await pool.query(`
+        DELETE FROM novedades
+        WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
+          AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
+      `)
+
+      // Insert con expira_en = medianoche de HOY Santiago (= 00:00 del día siguiente)
+      await pool.query(`
+        INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
+        VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
+          (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
+      `, [titulo, descripcion])
+
+      // Invalidar cache para que el próximo GET refleje la novedad
+      novedadesCache.delete('ufro')
+
+      await bot.sendMessage(chatId,
+        `✅ Menú guardado en Apprueba · caduca a medianoche.\n\n${descripcion}`
+      )
+    } catch (err) {
+      console.error('❌ Bot Telegram (photo):', err.message)
+      try { await bot.sendMessage(chatId, `⚠️ Error procesando: ${err.message}`) } catch(_) {}
+    }
+  })
+
+  // Webhook endpoint. Validación por secret header.
+  app.post('/telegram/webhook', (req, res) => {
+    const secret = req.header('X-Telegram-Bot-Api-Secret-Token')
+    if (!process.env.TELEGRAM_WEBHOOK_SECRET || secret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
+      return res.sendStatus(401)
+    }
+    bot.processUpdate(req.body)
+    res.sendStatus(200)
+  })
+
+  // Setup one-time del webhook — llama con POST { url: 'https://.../telegram/webhook' }
+  app.post('/admin/telegram/setup-webhook', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+      const { url } = req.body
+      if (!url) return res.status(400).json({ error: 'url requerida' })
+      if (!process.env.TELEGRAM_WEBHOOK_SECRET) return res.status(500).json({ error: 'TELEGRAM_WEBHOOK_SECRET no seteada' })
+      await bot.setWebHook(url, { secret_token: process.env.TELEGRAM_WEBHOOK_SECRET })
+      const info = await bot.getWebHookInfo()
+      res.json({ ok: true, webhook: info })
+    } catch (err) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  console.log(`🤖 Bot Telegram activo (${telegramAllowlist.size} usuarios autorizados)`)
+}
 
 // ── HORARIO ──────────────────────────────────────────────────────
 app.get('/horario', authenticateToken, async (req, res) => {
