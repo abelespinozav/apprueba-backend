@@ -1272,7 +1272,9 @@ app.get('/novedades', authenticateToken, async (req, res) => {
       `SELECT * FROM novedades
        WHERE universidad = $1 AND activa = true
          AND (expira_en IS NULL OR expira_en > NOW())
-       ORDER BY creada_en DESC`,
+       ORDER BY
+         CASE origen WHEN 'telegram' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+         creada_en DESC`,
       [uni]
     )
     if (rows.length > 0) return res.json(rows)
@@ -1330,6 +1332,16 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       .map(s => parseInt(s.trim(), 10))
       .filter(Number.isFinite)
   )
+
+  // Preview pendiente de confirmación por chat. TTL 10 min.
+  const pendingCasino = new Map() // chatId -> { titulo, descripcion, createdAt }
+  const PENDING_TTL_MS = 10 * 60 * 1000
+  function getPendingCasino(chatId) {
+    const e = pendingCasino.get(chatId)
+    if (!e) return null
+    if (Date.now() - e.createdAt > PENDING_TTL_MS) { pendingCasino.delete(chatId); return null }
+    return e
+  }
 
   const CASINO_PROMPT = 'Esta es una foto del menú del casino de la UFRO de hoy. '
     + 'Extrae los platos del día (entrada, plato de fondo, acompañamiento, postre, y vegetariano si aparece). '
@@ -1396,29 +1408,84 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         ? `🍽️ Menú · ${String(parsed.destacado).slice(0, 60)}`
         : '🍽️ Menú del casino hoy'
 
-      // Dedupe: borra el menú de HOY (Santiago) si ya existía
-      await pool.query(`
-        DELETE FROM novedades
-        WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
-          AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
-      `)
-
-      // Insert con expira_en = medianoche de HOY Santiago (= 00:00 del día siguiente)
-      await pool.query(`
-        INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
-        VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
-          (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
-      `, [titulo, descripcion])
-
-      // Invalidar cache para que el próximo GET refleje la novedad
-      novedadesCache.delete('ufro')
+      // Guardar preview en memoria — espera confirmación del usuario
+      pendingCasino.set(chatId, { titulo, descripcion, createdAt: Date.now() })
 
       await bot.sendMessage(chatId,
-        `✅ Menú guardado en Apprueba · caduca a medianoche.\n\n${descripcion}`
+        `📋 *Preview del menú:*\n\n${descripcion}\n\n¿Publicar en Apprueba?`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Publicar', callback_data: 'casino_publish' },
+              { text: '❌ Cancelar', callback_data: 'casino_cancel' }
+            ]]
+          }
+        }
       )
     } catch (err) {
       console.error('❌ Bot Telegram (photo):', err.message)
       try { await bot.sendMessage(chatId, `⚠️ Error procesando: ${err.message}`) } catch(_) {}
+    }
+  })
+
+  // Callback de los botones inline (publicar / cancelar el preview)
+  bot.on('callback_query', async (query) => {
+    const chatId = query.message?.chat?.id
+    const messageId = query.message?.message_id
+    const userId = query.from?.id
+    const data = query.data
+
+    if (!telegramAllowlist.has(userId)) {
+      try { await bot.answerCallbackQuery(query.id, { text: '🚫 No autorizado' }) } catch(_) {}
+      return
+    }
+
+    const pending = getPendingCasino(chatId)
+    if (!pending) {
+      try {
+        await bot.answerCallbackQuery(query.id, { text: 'No hay menú pendiente (expiró o ya fue procesado)' })
+        if (messageId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
+      } catch(_) {}
+      return
+    }
+
+    if (data === 'casino_cancel') {
+      pendingCasino.delete(chatId)
+      try {
+        await bot.answerCallbackQuery(query.id, { text: 'Cancelado' })
+        await bot.editMessageText('❌ Cancelado, no se publicó nada.', { chat_id: chatId, message_id: messageId })
+      } catch(_) {}
+      return
+    }
+
+    if (data === 'casino_publish') {
+      try {
+        // Dedupe: borra el menú de HOY (Santiago) si ya existía
+        await pool.query(`
+          DELETE FROM novedades
+          WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
+            AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
+        `)
+        // Insert con expira_en = medianoche de HOY Santiago
+        await pool.query(`
+          INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
+          VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
+            (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
+        `, [pending.titulo, pending.descripcion])
+        novedadesCache.delete('ufro')
+        pendingCasino.delete(chatId)
+
+        await bot.answerCallbackQuery(query.id, { text: '✅ Publicado' })
+        await bot.editMessageText(
+          `✅ Menú publicado en Apprueba · caduca a medianoche.\n\n${pending.descripcion}`,
+          { chat_id: chatId, message_id: messageId }
+        )
+      } catch (err) {
+        console.error('❌ Bot Telegram (callback publish):', err.message)
+        try { await bot.answerCallbackQuery(query.id, { text: 'Error al guardar' }) } catch(_) {}
+        try { await bot.sendMessage(chatId, `⚠️ Error: ${err.message}`) } catch(_) {}
+      }
     }
   })
 
