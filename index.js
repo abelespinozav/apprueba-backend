@@ -2633,6 +2633,11 @@ Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con ins
 app.put('/ramos/:id', authenticateToken, async (req, res) => {
   try {
     const { nombre, min_aprobacion, evaluaciones, nota_examen, nota_final, estado_final, ponderacion_examen, nota_eximicion, condiciones_eximicion, sin_rojos } = req.body
+    // Validación: suma de ponderaciones no puede superar 100%
+    const sumaPond = (evaluaciones || []).reduce((acc, e) => acc + (parseFloat(e.ponderacion) || 0), 0)
+    if (sumaPond > 100.01) {
+      return res.status(400).json({ error: `La suma de ponderaciones es ${sumaPond.toFixed(1)}%, no puede superar 100%` })
+    }
     const ramoResult = await pool.query(
       'UPDATE ramos SET nombre=$1, min_aprobacion=$2, nota_examen=$3, nota_final=$4, estado_final=$5, ponderacion_examen=$6, nota_eximicion=$7, condiciones_eximicion=$8, sin_rojos=$9 WHERE id=$10 AND usuario_id=$11 RETURNING *',
       [nombre, min_aprobacion, nota_examen||null, nota_final||null, estado_final||null, ponderacion_examen||25, nota_eximicion||null, condiciones_eximicion||null, sin_rojos||false, req.params.id, req.user.id]
@@ -2664,6 +2669,22 @@ app.put('/ramos/:id', authenticateToken, async (req, res) => {
 
 app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
   try {
+    // Si viene 'ponderacion', validar que la suma (excluyendo la eval actual) + nueva <= 100
+    if ('ponderacion' in req.body) {
+      const nuevaPond = parseFloat(req.body.ponderacion) || 0
+      const { rows } = await pool.query(
+        `SELECT COALESCE(SUM(ponderacion), 0) AS suma
+         FROM evaluaciones
+         WHERE ramo_id = $1 AND id <> $2
+         AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
+        [req.params.ramoId, req.params.evalId, req.user.id]
+      )
+      const sumaOtras = parseFloat(rows[0].suma) || 0
+      if (sumaOtras + nuevaPond > 100.01) {
+        const disponible = Math.max(0, 100 - sumaOtras)
+        return res.status(400).json({ error: `Ponderación excede el 100%. Disponible: ${disponible.toFixed(1)}%` })
+      }
+    }
     const ALLOWED = ['nota', 'nombre', 'fecha', 'ponderacion']
     const sets = []
     const vals = []
