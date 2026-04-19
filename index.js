@@ -1333,9 +1333,13 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 
   const CASINO_PROMPT = 'Esta es una foto del menú del casino de la UFRO de hoy. '
     + 'Extrae los platos del día (entrada, plato de fondo, acompañamiento, postre, y vegetariano si aparece). '
-    + 'Devuelve SOLO un JSON con la forma: '
-    + '{"platos":["Entrada: ...","Fondo: ...","Acompañamiento: ...","Postre: ...","Vegetariano: ..."],"destacado":"Plato estrella del día"}. '
-    + 'Si algún campo no aparece, omítelo del arreglo. '
+    + 'Devuelve SOLO un JSON con esta estructura exacta: '
+    + '{"platos":["Entrada: <nombre real>","Fondo: <nombre real>","Acompañamiento: <nombre real>","Postre: <nombre real>","Vegetariano: <nombre real>"],"destacado":"<nombre del plato de fondo principal, tal cual aparece en el menú>"}. '
+    + 'REGLAS ESTRICTAS: '
+    + '(1) "destacado" DEBE ser el nombre literal de un plato concreto del menú (p.ej. "Ragout de pollo"), NUNCA una frase genérica como "Plato estrella del día" o "Plato principal". '
+    + '(2) Si no logras identificar un plato de fondo específico, devuelve "destacado":"". '
+    + '(3) NO inventes platos. Si un campo (entrada/postre/etc.) no aparece en la foto, omítelo del arreglo — no generes placeholders. '
+    + '(4) No repitas el mismo plato en varias entradas del arreglo. '
     + 'Si la imagen NO es un menú de casino, devuelve {"platos":[],"destacado":""}.'
 
   bot.on('photo', async (msg) => {
@@ -1384,7 +1388,10 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         return
       }
 
-      const descripcion = parsed.platos.join(' · ').slice(0, 500)
+      const platosUnicos = Array.from(new Set(
+        parsed.platos.map(p => String(p).trim()).filter(Boolean)
+      ))
+      const descripcion = platosUnicos.join(' · ').slice(0, 500)
       const titulo = parsed.destacado
         ? `🍽️ Menú · ${String(parsed.destacado).slice(0, 60)}`
         : '🍽️ Menú del casino hoy'
