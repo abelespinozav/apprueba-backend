@@ -1924,7 +1924,9 @@ app.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
       SELECT
         COUNT(*) as total_usuarios,
         COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as nuevos_7d,
-        COUNT(CASE WHEN last_login > NOW() - INTERVAL '7 days' THEN 1 END) as activos_7d
+        COUNT(CASE WHEN last_login > NOW() - INTERVAL '1 day' THEN 1 END) as activos_hoy,
+        COUNT(CASE WHEN last_login > NOW() - INTERVAL '7 days' THEN 1 END) as activos_7d,
+        COUNT(CASE WHEN es_fundador = true THEN 1 END) as fundadores
       FROM usuarios
     `)
     const ramos = await pool.query('SELECT COUNT(*) as total_ramos FROM ramos')
@@ -1940,6 +1942,61 @@ app.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
   }
 })
 
+
+// Distribución de usuarios por universidad (para el dashboard admin)
+app.get('/admin/universidades-stats', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { rows } = await pool.query(
+      "SELECT universidad, COUNT(*) as count FROM usuarios WHERE universidad IS NOT NULL AND universidad <> '' GROUP BY universidad ORDER BY count DESC"
+    )
+    res.json(rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// Actividad diaria últimos 14 días (DAU basado en last_login)
+app.get('/admin/actividad-diaria', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { rows } = await pool.query(`
+      SELECT TO_CHAR(DATE(last_login), 'YYYY-MM-DD') as fecha, COUNT(DISTINCT id)::int as usuarios
+      FROM usuarios
+      WHERE last_login > NOW() - INTERVAL '14 days'
+      GROUP BY DATE(last_login)
+      ORDER BY DATE(last_login) ASC
+    `)
+    res.json(rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// Estado del bot Telegram (admin dashboard)
+app.get('/admin/telegram/status', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const activo = !!process.env.TELEGRAM_BOT_TOKEN
+    const allowlist = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+    const { rows } = await pool.query(
+      "SELECT COUNT(*) as total FROM novedades WHERE origen = 'telegram'"
+    )
+    res.json({
+      activo,
+      username: process.env.TELEGRAM_BOT_USERNAME || null,
+      total_publicaciones: parseInt(rows[0].total) || 0,
+      allowlist
+    })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// Todas las novedades (incluyendo expiradas) para el panel admin
+app.get('/admin/novedades', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM novedades ORDER BY creada_en DESC LIMIT 200'
+    )
+    res.json(rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
 // Detalle completo de un usuario (solo admin)
 app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (req, res) => {
