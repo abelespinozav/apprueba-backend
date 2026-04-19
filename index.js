@@ -737,10 +737,28 @@ app.get('/ramos', authenticateToken, async (req, res) => {
 })
 
 app.post('/ramos', authenticateToken, async (req, res) => {
-  const { nombre, minAprobacion, evaluaciones } = req.body
+  const {
+    nombre,
+    min_aprobacion, minAprobacion,  // acepta snake y camel
+    nota_eximicion,
+    condiciones_eximicion,
+    sin_rojos,
+    ponderacion_examen,
+    evaluaciones
+  } = req.body
+  const minAp = min_aprobacion ?? minAprobacion ?? 4.0
   const { rows } = await pool.query(
-    'INSERT INTO ramos (usuario_id, nombre, min_aprobacion) VALUES ($1, $2, $3) RETURNING *',
-    [req.user.id, nombre, minAprobacion || 4.0]
+    `INSERT INTO ramos (usuario_id, nombre, min_aprobacion, nota_eximicion, condiciones_eximicion, sin_rojos, ponderacion_examen)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    [
+      req.user.id,
+      nombre,
+      minAp,
+      nota_eximicion || null,
+      condiciones_eximicion || null,
+      sin_rojos || false,
+      ponderacion_examen || 25
+    ]
   )
   const ramo = rows[0]
   for (const e of (evaluaciones || [])) {
