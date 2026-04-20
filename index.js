@@ -2889,7 +2889,9 @@ app.get('/admin/limites-globales', authenticateToken, requireAdmin, async (req, 
   }
 })
 
-app.post('/admin/limites-globales', authenticateToken, requireAdmin, async (req, res) => {
+// POST y PUT ambos aceptados: clientes REST-puristas esperan PUT para un
+// update idempotente de la config. Mismo handler.
+const actualizarLimitesGlobales = async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   const client = await pool.connect()
   try {
@@ -2926,12 +2928,14 @@ app.post('/admin/limites-globales', authenticateToken, requireAdmin, async (req,
     res.json({ ok: true })
   } catch(err) {
     await client.query('ROLLBACK').catch(() => {})
-    console.error('Error POST /admin/limites-globales:', err)
+    console.error('Error /admin/limites-globales:', err)
     res.status(500).json({ error: err.message })
   } finally {
     client.release()
   }
-})
+}
+app.post('/admin/limites-globales', authenticateToken, requireAdmin, actualizarLimitesGlobales)
+app.put('/admin/limites-globales',  authenticateToken, requireAdmin, actualizarLimitesGlobales)
 
 // Actualiza los 4 límites individuales de un usuario. null = usar global.
 app.patch('/admin/usuarios/:id/limites', authenticateToken, requireAdmin, async (req, res) => {
