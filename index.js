@@ -544,6 +544,13 @@ async function initDB() {
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_fundador BOOLEAN DEFAULT false;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS numero_registro INTEGER;
+    -- Límites individuales por tipo. NULL = usar limite_global. Admin los
+    -- setea desde el modal de detalle; sobrescriben el global solo para
+    -- ese usuario y tipo.
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_limite INTEGER;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_limite INTEGER;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS podcasts_limite INTEGER;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_limite INTEGER;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_admin BOOLEAN DEFAULT false;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS podcasts_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
@@ -1000,6 +1007,29 @@ function formatPerfilBloque(perfil) {
 
 // Retry con backoff para llamadas gpt-4o chat completions. Bail inmediato
 // en 401/403 (no tiene sentido reintentar con credenciales rotas).
+// Resuelve el límite efectivo para un usuario y tipo. Si el usuario tiene
+// un override individual, usa ese; sino cae a configuracion.limite_global.
+async function resolverLimite(userId, tipo) {
+  const columnas = {
+    planes: 'planes_limite',
+    quizzes: 'quizzes_limite',
+    podcasts: 'podcasts_limite',
+    ejercicios: 'ejercicios_limite'
+  }
+  const col = columnas[tipo]
+  if (!col) throw new Error(`Tipo de límite inválido: ${tipo}`)
+  const { rows } = await pool.query(
+    `SELECT u.${col} AS individual,
+            (SELECT valor FROM configuracion WHERE clave = 'limite_global') AS global
+     FROM usuarios u WHERE u.id = $1`,
+    [userId]
+  )
+  const individual = rows[0]?.individual
+  if (individual !== null && individual !== undefined) return parseInt(individual)
+  const global = rows[0]?.global
+  return global ? parseInt(global) : 100
+}
+
 async function callOpenAIWithRetry(params, maxRetries = 2) {
   let lastErr
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1156,11 +1186,10 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     // check simultáneamente y gastando cupo doble). Si la IA falla después,
     // se hace refund decrementando el contador.
     if (ev.plan_estudio) {
-      const limiteResP = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
-      const limiteGlobalP = limiteResP.rows.length ? parseInt(limiteResP.rows[0].valor) : 100
+      const limiteP = await resolverLimite(req.user.id, 'planes')
       const { rowCount } = await pool.query(
         'UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1 AND planes_usados < $2',
-        [req.user.id, limiteGlobalP]
+        [req.user.id, limiteP]
       )
       if (rowCount === 0) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
       planContadoEnLimite = true
@@ -2579,7 +2608,8 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (re
              created_at, last_login,
              es_fundador, numero_registro,
              onboarding_v2, onboarding_completado,
-             podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados
+             podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados,
+             planes_limite, quizzes_limite, podcasts_limite, ejercicios_limite
       FROM usuarios WHERE id = $1
     `, [uid])
     if (usuarioRows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' })
@@ -2664,6 +2694,36 @@ app.get('/admin/limite-global', authenticateToken, requireAdmin, async (req, res
     res.json({ limite })
   } catch(e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// Actualiza los 4 límites individuales de un usuario. null = usar global.
+app.patch('/admin/usuarios/:id/limites', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const CAMPOS = ['planes_limite', 'quizzes_limite', 'podcasts_limite', 'ejercicios_limite']
+    const sets = []
+    const vals = []
+    for (const c of CAMPOS) {
+      if (!(c in req.body)) continue
+      const v = req.body[c]
+      // '' o null explícito → NULL (vuelve al global). Número negativo inválido.
+      const parsed = (v === '' || v === null || v === undefined) ? null : parseInt(v)
+      if (parsed !== null && (isNaN(parsed) || parsed < 0)) return res.status(400).json({ error: `${c} inválido` })
+      sets.push(`${c} = $${vals.length + 1}`)
+      vals.push(parsed)
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'Sin campos para actualizar' })
+    vals.push(req.params.id)
+    const { rowCount } = await pool.query(
+      `UPDATE usuarios SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING planes_limite, quizzes_limite, podcasts_limite, ejercicios_limite`,
+      vals
+    )
+    if (rowCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' })
+    res.json({ ok: true })
+  } catch(err) {
+    console.error('Error PATCH límites:', err)
+    res.status(500).json({ error: 'Error al actualizar límites' })
   }
 })
 
@@ -3092,8 +3152,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     const evId = req.params.id
     const tareaIdx = req.body.tareaIdx ?? null
     // Check-and-set atómico antes de invocar IA (previene race condition).
-    const limiteRes = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
-    const limiteGlobal = limiteRes.rows.length ? parseInt(limiteRes.rows[0].valor) : 100
+    const limiteGlobal = await resolverLimite(userId, 'podcasts')
     const { rows: incRows } = await pool.query(
       'UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1 AND podcasts_usados < $2 RETURNING podcasts_usados',
       [userId, limiteGlobal]
@@ -3456,8 +3515,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
     // Check-and-set atómico antes de la IA.
-    const limiteResQ = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
-    const limiteGlobalQ = limiteResQ.rows.length ? parseInt(limiteResQ.rows[0].valor) : 100
+    const limiteGlobalQ = await resolverLimite(req.user.id, 'quizzes')
     const { rows: incQ } = await pool.query(
       'UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1 AND quizzes_usados < $2 RETURNING quizzes_usados',
       [req.user.id, limiteGlobalQ]
@@ -3633,8 +3691,7 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
     }
 
     // Check-and-set atómico antes de la IA.
-    const limiteResE = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
-    const limiteGlobalE = limiteResE.rows.length ? parseInt(limiteResE.rows[0].valor) : 100
+    const limiteGlobalE = await resolverLimite(req.user.id, 'ejercicios')
     const { rows: incE } = await pool.query(
       'UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1 AND ejercicios_usados < $2 RETURNING ejercicios_usados',
       [req.user.id, limiteGlobalE]
