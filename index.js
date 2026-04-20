@@ -973,6 +973,8 @@ async function callOpenAIWithRetry(params, maxRetries = 2) {
       return await openaiClient.chat.completions.create(params)
     } catch (err) {
       lastErr = err
+      // Bail inmediato si el cliente abortó (AbortController): reintento inútil.
+      if (err?.name === 'AbortError' || err?.message === 'aborted' || params.signal?.aborted) throw err
       if (err.status === 401 || err.status === 403) throw err
       if (attempt === maxRetries) throw err
       console.warn(`OpenAI retry ${attempt}/${maxRetries}: ${err.message}`)
@@ -1160,15 +1162,34 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     const usuarioId = req.user.id
     const nombreEval = ev.nombre || 'tu evaluación'
 
+    // Abort cuando el cliente cierra la conexión o cuando pasan 15 min.
+    // Antes: setImmediate corría sin corte, consumiendo OpenAI + CPU si el
+    // usuario cerraba el tab o la generación se colgaba.
+    const abortCtl = new AbortController()
+    const abortTimer = setTimeout(() => abortCtl.abort(), 15 * 60 * 1000)
+    res.on('close', () => { if (!abortCtl.signal.aborted) abortCtl.abort() })
+
     // Procesar en background — el usuario puede salir
     setImmediate(async () => {
+      const refundYEnd = async (err) => {
+        clearTimeout(abortTimer)
+        await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
+        if (planContadoEnLimite) {
+          await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
+        }
+        const abortado = err?.name === 'AbortError' || abortCtl.signal.aborted
+        terminar('error', {
+          error: abortado ? 'cancelado' : 'error_interno',
+          mensaje: abortado ? 'La generación fue cancelada.' : 'No se pudo generar el plan. Intenta de nuevo.'
+        })
+      }
       try {
         enviar('progreso', { msg: '🧠 Analizando todo el material con IA...' })
         const result = await openai.chat.completions.create({
           model: 'gpt-4o',
           messages: [{ role: 'user', content: promptFinal }],
           temperature: 0.7
-        })
+        }, { signal: abortCtl.signal })
         const text = result.choices[0].message.content
         const jsonMatch = text.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error('No JSON')
@@ -1187,34 +1208,35 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
             }
           }
         }
+        clearTimeout(abortTimer)
         terminar('plan', { plan })
         // Notificar al usuario
         await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
       } catch(geminiErr) {
         console.error('GPT error:', geminiErr.message)
+        // Si ya fue abortado (cliente cerró o timeout), no reintentes.
+        if (geminiErr?.name === 'AbortError' || abortCtl.signal.aborted) {
+          return refundYEnd(geminiErr)
+        }
         try {
           enviar('progreso', { msg: '⚠️ Reintentando...' })
           const fallback = await openai.chat.completions.create({
             model: 'gpt-4o',
             messages: [{ role: 'user', content: promptFinal }],
             temperature: 0.7
-          })
+          }, { signal: abortCtl.signal })
           const text2 = fallback.choices[0].message.content
           const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
           if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
           const plan2 = JSON.parse(jsonMatch2[0])
           await pool.query('UPDATE evaluaciones SET plan_estudio = $1, guias_tareas = NULL, plan_generando = FALSE WHERE id = $2', [JSON.stringify(plan2), evalId])
           await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
+          clearTimeout(abortTimer)
           terminar('plan', { plan: plan2 })
           await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
         } catch(fallbackErr) {
           console.error('Fallback error:', fallbackErr.message)
-          await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId])
-          // Refund: la IA falló, devolvemos el cupo consumido atómicamente.
-          if (planContadoEnLimite) {
-            await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
-          }
-          terminar('error', { error: 'error_interno', mensaje: 'No se pudo generar el plan. Intenta de nuevo.' })
+          await refundYEnd(fallbackErr)
         }
       }
     })
@@ -3392,6 +3414,11 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     const usuarioId = req.user.id
     const evalId = req.params.id
 
+    // Abort si el cliente cierra o si pasan 15 min (generación colgada).
+    const abortCtl = new AbortController()
+    const abortTimer = setTimeout(() => abortCtl.abort(), 15 * 60 * 1000)
+    res.on('close', () => { if (!abortCtl.signal.aborted) abortCtl.abort() })
+
     setImmediate(async () => {
       try {
         let textoArchivos = ev.texto_material || ''
@@ -3443,7 +3470,8 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         const result = await callOpenAIWithRetry({
           model: 'gpt-4o',
           messages: [{ role: 'user', content: prompt }],
-          temperature: 0.7
+          temperature: 0.7,
+          signal: abortCtl.signal
         })
         let text = result.choices[0].message.content
         text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
@@ -3474,13 +3502,19 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         enviar('progreso', { msg: '✅ Quiz generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
         // Contador ya incrementado atómicamente antes del setImmediate.
+        clearTimeout(abortTimer)
         enviar('quiz', { preguntas: quizData.preguntas })
         if (!res.destroyed) res.end()
       } catch (err) {
         console.error('Error generando quiz:', err)
-        // Refund: la IA falló, devolvemos el cupo.
+        clearTimeout(abortTimer)
+        const abortado = err?.name === 'AbortError' || abortCtl.signal.aborted
+        // Refund: IA falló o fue cancelada, devolvemos el cupo.
         await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
-        enviar('error', { error: 'fallo_ia', mensaje: 'Error al generar quiz: ' + err.message })
+        enviar('error', {
+          error: abortado ? 'cancelado' : 'fallo_ia',
+          mensaje: abortado ? 'La generación fue cancelada.' : 'Error al generar quiz: ' + err.message
+        })
         if (!res.destroyed) res.end()
       }
     })
