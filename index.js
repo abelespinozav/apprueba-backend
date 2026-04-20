@@ -1499,10 +1499,26 @@ function setCachedNovedades(uni, data) {
 // keywords universitarios y descarta posts con >45 días.
 function scrapeJunaeb() {
   const axios = require('axios')
-  return axios.get(
-    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
-    { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-  ).then(({ data: posts }) => {
+  const url = 'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link'
+  // 15s en vez de 8s: la API es WordPress de gob.cl y en picos de carga
+  // tarda más de 8s. Con 1 retry tras 2s cubrimos las caídas intermitentes
+  // sin afectar al cron (el timeout total es 15+2+15 = 32s peor caso, pero
+  // usualmente resuelve en el primer intento).
+  const opts = { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+
+  async function intentar() {
+    try {
+      return (await axios.get(url, opts)).data
+    } catch (err) {
+      const es5xx = err.response?.status >= 500
+      const esTimeout = err.code === 'ECONNABORTED' || err.message?.includes('timeout')
+      if (!es5xx && !esTimeout) throw err
+      await new Promise(r => setTimeout(r, 2000))
+      return (await axios.get(url, opts)).data
+    }
+  }
+
+  return intentar().then(posts => {
     const items = []
     const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
     const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
@@ -3535,7 +3551,9 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
         if (response.status === 429) {
           lastErrText = '429 Too Many Requests'
           if (i < intentos - 1) {
-            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)))
+            // Backoff más agresivo: 2s/4s/8s. El tier F0 tarda en resetear
+            // el rate limit y 1s/2s/4s no alcanzaba en podcasts largos.
+            await new Promise(r => setTimeout(r, 2000 * Math.pow(2, i)))
             continue
           }
           throw new Error(`Azure TTS error: 429 tras ${intentos} intentos`)
@@ -3550,11 +3568,13 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       throw new Error(`Azure TTS: ${lastErrText}`)
     }
 
-    // Generar cada SSML, luego procesar en lotes de 4 concurrentes.
-    // Antes era serial (for ... await): 30 segs * ~250ms = ~7.5s y además
-    // cualquier pico de latencia se acumulaba. Ahora ~8s peak → ~2s con 4x.
-    // Orden preservado porque cada lote usa Promise.all con índices fijos.
-    const LOTE = 4
+    // Procesa los SSML en lotes pequeños para no saturar el tier F0 de Azure
+    // TTS (límite ~20 req/s). Con LOTE=2 y pausa 500ms entre lotes, el ritmo
+    // es ~4 req/s de peak — muy conservador pero evita 429 en podcasts
+    // largos (80 segmentos). Orden preservado: los lotes corren secuenciales
+    // y cada lote usa Promise.all con índices fijos.
+    const LOTE = 2
+    const PAUSA_ENTRE_LOTES_MS = 500
     const ssmls = guion.segmentos.map(seg => {
       const voiceName = VOCES_AZURE[seg.voz] || VOCES_AZURE.constanza
       return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="es-CL"><voice name="${voiceName}"><prosody rate="${AZURE_TTS_RATE}">${xmlEscape(seg.texto)}</prosody></voice></speak>`
@@ -3566,6 +3586,10 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
         lote.map(ssml => llamarAzureTTS(ssml, azureEndpoint, process.env.AZURE_TTS_KEY))
       )
       audioBuffers.push(...resultados)
+      // Pausa entre lotes, pero no después del último (ahorra ½s).
+      if (i + LOTE < ssmls.length) {
+        await new Promise(r => setTimeout(r, PAUSA_ENTRE_LOTES_MS))
+      }
     }
     const audioFinal = Buffer.concat(audioBuffers)
     // El contador ya se incrementó atómicamente antes de llamar IA.
