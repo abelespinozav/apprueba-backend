@@ -1615,8 +1615,13 @@ cron.schedule('45 */2 * * *', refrescarNovedadesInacap, { timezone: 'America/San
 
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
-    const { universidad } = req.query
-    const uni = universidad || 'ufro'
+    // La universidad se deriva del usuario autenticado, NO del query string.
+    // Antes: const uni = req.query.universidad || 'ufro' — eso servía UFRO a
+    // cualquier cliente que no mandara el param (bug real: usuarios UA viendo
+    // noticias UFRO cuando la cadena de estado del frontend fallaba).
+    const userRes = await pool.query('SELECT universidad FROM usuarios WHERE id = $1', [req.user.id])
+    const uni = userRes.rows[0]?.universidad
+    if (!uni) return res.json([])
     const { rows } = await pool.query(
       `SELECT * FROM novedades
        WHERE universidad = $1 AND activa = true
