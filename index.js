@@ -1387,6 +1387,112 @@ async function refrescarNovedadesUfro() {
 
 cron.schedule('0 */2 * * *', refrescarNovedadesUfro, { timezone: 'America/Santiago' })
 
+// Scrape Universidad Mayor (diariomayor.cl, Joomla sin WP REST ni RSS).
+// Parsea microdatos schema.org: a[itemprop="url"] + span[itemprop="datePublished"].
+// Agrega JUNAEB (mismo filtro que UFRO) como fuente nacional.
+async function scrapeMayorNovedades() {
+  const axios = require('axios')
+  const cheerio = require('cheerio')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const diario = axios.get(
+    'https://www.diariomayor.cl/',
+    { timeout: 10000, headers: ua }
+  ).then(({ data: html }) => {
+    const $ = cheerio.load(html)
+    const categoriaDesde = (href) => {
+      if (href.startsWith('/creando-universidad/estudiantes')) return { tipo: 'Vida Estudiantil', emoji: '🎓', color: '#34d399' }
+      if (href.startsWith('/ciencia-um')) return { tipo: 'Ciencia', emoji: '🧪', color: '#a78bfa' }
+      if (href.startsWith('/lo-ultimo/cultura')) return { tipo: 'Cultura', emoji: '🎭', color: '#f472b6' }
+      if (href.startsWith('/creando-universidad/academicos')) return { tipo: 'Académico', emoji: '📚', color: '#60a5fa' }
+      return { tipo: 'Noticia', emoji: '📰', color: '#60a5fa' }
+    }
+    // Secciones tipo prensa/columna/video — no son noticias internas, se saltan.
+    const SKIP = ['/el-mercurio/', '/medios-regionales', '/videos/', '/marcando-pauta/', '/miradas/']
+    const vistos = new Set()
+    const items = []
+    $('a[itemprop="url"]').each((_, el) => {
+      if (items.length >= 5) return
+      const href = ($(el).attr('href') || '').trim()
+      const titulo = $(el).text().trim().replace(/\s+/g, ' ')
+      if (!titulo || titulo.length < 12 || titulo.length > 200) return
+      if (!href.startsWith('/') || SKIP.some(p => href.startsWith(p))) return
+      if (vistos.has(href)) return
+      vistos.add(href)
+      const cat = categoriaDesde(href)
+      const wrap = $(el).closest('article, [class*="sppb-addon"]')
+      const fecha = wrap.length
+        ? wrap.find('[itemprop="datePublished"]').first().text().replace(/\s+/g, ' ').trim()
+        : ''
+      items.push({
+        tipo: cat.tipo,
+        emoji: cat.emoji,
+        titulo: titulo.slice(0, 75),
+        descripcion: (fecha || 'Diario Mayor · U. Mayor').slice(0, 70),
+        color: cat.color,
+        link: 'https://www.diariomayor.cl' + href
+      })
+    })
+    return items
+  })
+
+  const junaeb = axios.get(
+    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
+    { timeout: 8000, headers: ua }
+  ).then(({ data: posts }) => {
+    const items = []
+    const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
+    const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
+    const now = Date.now()
+    for (const post of posts) {
+      if (items.length >= 2) break
+      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+      if (!titulo || !RELEVANTE.test(titulo)) continue
+      const fechaMs = post.date ? new Date(post.date).getTime() : 0
+      if (!fechaMs || now - fechaMs > DIAS_45_MS) continue
+      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+      items.push({
+        tipo: 'Beneficio', emoji: '💳',
+        titulo: titulo.slice(0, 75),
+        descripcion: desc ? desc.slice(0, 70) : 'JUNAEB · anuncio nacional',
+        color: '#fbbf24',
+        link: post.link
+      })
+    }
+    return items
+  })
+
+  const results = await Promise.allSettled([diario, junaeb])
+  const labels = ['Diario Mayor', 'JUNAEB']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 8)
+}
+
+async function refrescarNovedadesMayor() {
+  try {
+    const items = await scrapeMayorNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'umayor' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('umayor', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('umayor', items)
+    console.log(`📰 Novedades U. Mayor refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades U. Mayor:', err.message)
+  }
+}
+
+// Cron 15 min después de UFRO para no golpear JUNAEB en paralelo.
+cron.schedule('15 */2 * * *', refrescarNovedadesMayor, { timezone: 'America/Santiago' })
+
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
     const { universidad } = req.query
@@ -1402,19 +1508,20 @@ app.get('/novedades', authenticateToken, async (req, res) => {
     )
     if (rows.length > 0) return res.json(rows)
 
-    // Fallback live solo para UFRO (con cache en memoria de 2h)
-    if (uni === 'ufro') {
+    // Fallback live (con cache en memoria de 2h) para universidades con scraper
+    const scrapers = { ufro: scrapeUfroNovedades, umayor: scrapeMayorNovedades }
+    if (scrapers[uni]) {
       const cached = getCachedNovedades(uni)
       if (cached) return res.json(cached)
 
       try {
-        const novedades = await scrapeUfroNovedades()
+        const novedades = await scrapers[uni]()
         if (novedades.length > 0) {
           setCachedNovedades(uni, novedades)
           return res.json(novedades)
         }
       } catch (scrapeErr) {
-        console.log('API UFRO falló:', scrapeErr.message)
+        console.log(`Scrape ${uni} falló:`, scrapeErr.message)
       }
     }
 
