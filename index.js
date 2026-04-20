@@ -1256,6 +1256,37 @@ function setCachedNovedades(uni, data) {
   novedadesCache.set(uni, { timestamp: Date.now(), data })
 }
 
+// Fuente nacional compartida por todas las universidades. Filtra por
+// keywords universitarios y descarta posts con >45 días.
+function scrapeJunaeb() {
+  const axios = require('axios')
+  return axios.get(
+    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
+    { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+  ).then(({ data: posts }) => {
+    const items = []
+    const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
+    const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
+    const now = Date.now()
+    for (const post of posts) {
+      if (items.length >= 2) break
+      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+      if (!titulo || !RELEVANTE.test(titulo)) continue
+      const fechaMs = post.date ? new Date(post.date).getTime() : 0
+      if (!fechaMs || now - fechaMs > DIAS_45_MS) continue
+      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+      items.push({
+        tipo: 'Beneficio', emoji: '💳',
+        titulo: titulo.slice(0, 75),
+        descripcion: desc ? desc.slice(0, 70) : 'JUNAEB · anuncio nacional',
+        color: '#fbbf24',
+        link: post.link
+      })
+    }
+    return items
+  })
+}
+
 // Scrape UFRO en paralelo (3 fuentes con Promise.allSettled).
 // Worst-case ≈ timeout más largo (DDE, 15s) en vez de la suma (28s).
 async function scrapeUfroNovedades() {
@@ -1327,35 +1358,7 @@ async function scrapeUfroNovedades() {
     return items
   })
 
-  // JUNAEB · WP REST abierto. Filtra por keyword relevante a universitarios
-  // y descarta posts con más de 45 días. Máximo 2 items.
-  const junaeb = axios.get(
-    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
-    { timeout: 8000, headers: ua }
-  ).then(({ data: posts }) => {
-    const items = []
-    const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
-    const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
-    const now = Date.now()
-    for (const post of posts) {
-      if (items.length >= 2) break
-      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
-      if (!titulo || !RELEVANTE.test(titulo)) continue
-      const fechaMs = post.date ? new Date(post.date).getTime() : 0
-      if (!fechaMs || now - fechaMs > DIAS_45_MS) continue
-      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
-      items.push({
-        tipo: 'Beneficio', emoji: '💳',
-        titulo: titulo.slice(0, 75),
-        descripcion: desc ? desc.slice(0, 70) : 'JUNAEB · anuncio nacional',
-        color: '#fbbf24',
-        link: post.link
-      })
-    }
-    return items
-  })
-
-  const results = await Promise.allSettled([wp, agenda, dde, junaeb])
+  const results = await Promise.allSettled([wp, agenda, dde, scrapeJunaeb()])
   const labels = ['WP REST', 'Agenda', 'DDE', 'JUNAEB']
   const novedades = []
   results.forEach((r, i) => {
@@ -1436,33 +1439,7 @@ async function scrapeMayorNovedades() {
     return items
   })
 
-  const junaeb = axios.get(
-    'https://www.junaeb.cl/wp-json/wp/v2/posts?per_page=10&_fields=title,excerpt,date,link',
-    { timeout: 8000, headers: ua }
-  ).then(({ data: posts }) => {
-    const items = []
-    const RELEVANTE = /\b(bes|baes|tne|beca|gratuidad|residencia familiar|fuas|superior|universi|alimentaci[oó]n|pae|bare|arancel)\b/i
-    const DIAS_45_MS = 45 * 24 * 60 * 60 * 1000
-    const now = Date.now()
-    for (const post of posts) {
-      if (items.length >= 2) break
-      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
-      if (!titulo || !RELEVANTE.test(titulo)) continue
-      const fechaMs = post.date ? new Date(post.date).getTime() : 0
-      if (!fechaMs || now - fechaMs > DIAS_45_MS) continue
-      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
-      items.push({
-        tipo: 'Beneficio', emoji: '💳',
-        titulo: titulo.slice(0, 75),
-        descripcion: desc ? desc.slice(0, 70) : 'JUNAEB · anuncio nacional',
-        color: '#fbbf24',
-        link: post.link
-      })
-    }
-    return items
-  })
-
-  const results = await Promise.allSettled([diario, junaeb])
+  const results = await Promise.allSettled([diario, scrapeJunaeb()])
   const labels = ['Diario Mayor', 'JUNAEB']
   const novedades = []
   results.forEach((r, i) => {
@@ -1493,6 +1470,149 @@ async function refrescarNovedadesMayor() {
 // Cron 15 min después de UFRO para no golpear JUNAEB en paralelo.
 cron.schedule('15 */2 * * *', refrescarNovedadesMayor, { timezone: 'America/Santiago' })
 
+// Scrape U. Autónoma. WP REST deshabilitada y /feed/ → 500, pero /noticias/
+// renderiza cards con estructura estable: article.custom-card--news con
+// .text (título), .date (dd/mm/aaaa), .tag (categoría) y a.stretched-link.
+async function scrapeAutonomaNovedades() {
+  const axios = require('axios')
+  const cheerio = require('cheerio')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const noticias = axios.get(
+    'https://www.uautonoma.cl/noticias/',
+    { timeout: 10000, headers: ua }
+  ).then(({ data: html }) => {
+    const $ = cheerio.load(html)
+    const items = []
+    $('article.custom-card--news').each((_, el) => {
+      if (items.length >= 6) return
+      const $el = $(el)
+      const titulo = $el.find('.text').first().text().trim().replace(/\s+/g, ' ')
+      const fecha = $el.find('.date').first().text().trim()
+      const tag = $el.find('.tag').first().text().trim().replace(/\s+/g, ' ')
+      const link = $el.find('a.stretched-link').first().attr('href') || ''
+      if (!titulo || titulo.length < 10) return
+      items.push({
+        tipo: 'Noticia',
+        emoji: '📰',
+        titulo: titulo.slice(0, 75),
+        descripcion: (tag || fecha || 'Noticias · U. Autónoma').slice(0, 70),
+        color: '#60a5fa',
+        link: link || 'https://www.uautonoma.cl/noticias/'
+      })
+    })
+    return items
+  })
+
+  const results = await Promise.allSettled([noticias, scrapeJunaeb()])
+  const labels = ['UA Noticias', 'JUNAEB']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 8)
+}
+
+async function refrescarNovedadesAutonoma() {
+  try {
+    const items = await scrapeAutonomaNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'uautonoma' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('uautonoma', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('uautonoma', items)
+    console.log(`📰 Novedades U. Autónoma refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades U. Autónoma:', err.message)
+  }
+}
+
+cron.schedule('30 */2 * * *', refrescarNovedadesAutonoma, { timezone: 'America/Santiago' })
+
+// Scrape INACAP. Sitio Liferay en portal.inacap.cl/noticias1 — cada nota
+// es h2.component-heading con <a> al slug /w/..., seguida (en el mismo
+// layout) por un .component-paragraph de descripción y fecha editable.
+async function scrapeInacapNovedades() {
+  const axios = require('axios')
+  const cheerio = require('cheerio')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const noticias = axios.get(
+    'https://portal.inacap.cl/noticias1',
+    { timeout: 12000, headers: ua }
+  ).then(({ data: html }) => {
+    const $ = cheerio.load(html)
+    const vistos = new Set()
+    const items = []
+    $('h2.component-heading a').each((_, el) => {
+      if (items.length >= 6) return
+      const $a = $(el)
+      const titulo = $a.text().trim().replace(/\s+/g, ' ')
+      const link = ($a.attr('href') || '').trim()
+      if (!titulo || titulo.length < 12 || !link) return
+      if (vistos.has(link)) return
+      vistos.add(link)
+      // El col.d-flex.flex-column suele envolver UNA nota (título + párrafo
+      // + fecha). Si no se encuentra, cae al row (agrupa varias — descarta
+      // descripción para no pegarla al título equivocado).
+      const col = $a.closest('.col.d-flex.flex-column')
+      let desc = ''
+      let fecha = ''
+      if (col.length) {
+        desc = col.find('.component-paragraph').first().text().trim().replace(/\s+/g, ' ')
+        fecha = col.find('[data-lfr-editable-type="date-time"]').first().text().trim()
+      } else {
+        const row = $a.closest('[class*="lfr-layout-structure-item-row"]')
+        // Solo toma fecha; descripción la saltamos para evitar mismatch.
+        fecha = row.find('[data-lfr-editable-type="date-time"]').first().text().trim()
+      }
+      items.push({
+        tipo: 'Noticia',
+        emoji: '📰',
+        titulo: titulo.slice(0, 75),
+        descripcion: (desc || fecha || 'INACAP · Portal').slice(0, 70),
+        color: '#60a5fa',
+        link
+      })
+    })
+    return items
+  })
+
+  const results = await Promise.allSettled([noticias, scrapeJunaeb()])
+  const labels = ['INACAP Noticias', 'JUNAEB']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 8)
+}
+
+async function refrescarNovedadesInacap() {
+  try {
+    const items = await scrapeInacapNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'inacap' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('inacap', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('inacap', items)
+    console.log(`📰 Novedades INACAP refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades INACAP:', err.message)
+  }
+}
+
+cron.schedule('45 */2 * * *', refrescarNovedadesInacap, { timezone: 'America/Santiago' })
+
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
     const { universidad } = req.query
@@ -1509,7 +1629,12 @@ app.get('/novedades', authenticateToken, async (req, res) => {
     if (rows.length > 0) return res.json(rows)
 
     // Fallback live (con cache en memoria de 2h) para universidades con scraper
-    const scrapers = { ufro: scrapeUfroNovedades, umayor: scrapeMayorNovedades }
+    const scrapers = {
+      ufro: scrapeUfroNovedades,
+      umayor: scrapeMayorNovedades,
+      uautonoma: scrapeAutonomaNovedades,
+      inacap: scrapeInacapNovedades
+    }
     if (scrapers[uni]) {
       const cached = getCachedNovedades(uni)
       if (cached) return res.json(cached)
