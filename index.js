@@ -87,6 +87,19 @@ async function enviarPushYLimpiar(row, payload, tag = 'push') {
 
 async function notificarUsuario(usuarioId, titulo, cuerpo, url) {
   try {
+    // Respetar el toggle del usuario. Si apagó notificaciones en el panel
+    // (config.activo = false) no le mandamos nada. Null/ausente también
+    // se considera "no enviar" — consistente con el filtro de los crons
+    // que usan WHERE activo = true. Antes el helper enviaba siempre y sólo
+    // los crons chequeaban; ahora también los endpoints IA lo respetan.
+    const { rows: cfg } = await pool.query(
+      'SELECT activo FROM notificacion_config WHERE usuario_id = $1',
+      [usuarioId]
+    )
+    if (cfg[0]?.activo !== true) {
+      console.log(`[notif] user ${usuarioId} — skip (config.activo=${cfg[0]?.activo ?? 'null'})`)
+      return
+    }
     const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
     const payload = buildPushPayload({ title: titulo, body: cuerpo, url })
     for (const row of subs) {
@@ -3079,6 +3092,43 @@ app.post('/notificaciones/config', authenticateToken, async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
 
+// Estado consolidado de push notifications del usuario. Source of truth
+// del BACKEND — la UI lo usa para decidir si prometer "te avisaremos"
+// sin mentir. NO incluye Notification.permission (eso lo sabe el browser
+// localmente). Un usuario "puede_recibir" si tiene al menos 1 subscription
+// viva en push_subscriptions Y config.activo === true.
+app.get('/notificaciones/estado', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM push_subscriptions WHERE usuario_id = $1)::int AS subs,
+         (SELECT activo FROM notificacion_config WHERE usuario_id = $1) AS cfg_activo`,
+      [req.user.id]
+    )
+    const subs = rows[0]?.subs || 0
+    const cfgActivo = rows[0]?.cfg_activo
+    let razon = 'ok'
+    let puedeRecibir = true
+    if (subs === 0) { razon = 'sin_subscription'; puedeRecibir = false }
+    else if (cfgActivo === false) { razon = 'config_off'; puedeRecibir = false }
+    else if (cfgActivo === null || cfgActivo === undefined) {
+      // Nunca tocó el panel — `config.activo` es null. Los crons filtran
+      // WHERE activo=true, así que null = no va a recibir hasta que active.
+      razon = 'sin_config'
+      puedeRecibir = false
+    }
+    res.json({
+      puede_recibir: puedeRecibir,
+      razon,
+      subscription_count: subs,
+      config_activo: cfgActivo === null || cfgActivo === undefined ? null : !!cfgActivo
+    })
+  } catch(err) {
+    console.error('Error /notificaciones/estado:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // Endpoint para obtener la VAPID public key
 
 // Broadcast notificación a todos los usuarios (solo admin)
@@ -3607,6 +3657,14 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     )
     res.set({ 'Content-Type': 'audio/mpeg', 'X-Podcasts-Usados': usados + 1, 'X-Podcast-Titulo': encodeURIComponent(tituloFinal) })
     res.send(audioFinal)
+    // Push al final. El user pidió podcast y es útil si cerró la tab mientras
+    // ElevenLabs/Azure tomaban 30+ segundos sintetizando.
+    await notificarUsuario(
+      userId,
+      '🎙️ ¡Tu podcast está listo!',
+      `"${tituloFinal}" ya está disponible para escuchar.`,
+      `/ramos/${ev.ramo_id}/plan/${evId}`
+    )
   } catch(err) {
     console.error('Error generando podcast:', err)
     if (podcastContadoEnLimite) {
@@ -3995,6 +4053,14 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         clearTimeout(abortTimer)
         enviar('quiz', { preguntas: quizData.preguntas })
         if (!res.destroyed) res.end()
+        // Push al final para el user que cerró la tab. notificarUsuario
+        // respeta config.activo internamente — si apagó el toggle, no dispara.
+        await notificarUsuario(
+          usuarioId,
+          '🧠 ¡Tu quiz está listo!',
+          `El quiz de "${ev.nombre}" ya está disponible.`,
+          `/ramos/${ev.ramo_id}/quiz/${evalId}`
+        )
       } catch (err) {
         console.error('Error generando quiz:', err)
         clearTimeout(abortTimer)
@@ -4100,6 +4166,12 @@ Responde SOLO con JSON válido:
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
       res.send(pdfBuf)
+      await notificarUsuario(
+        req.user.id,
+        '📄 ¡Tus ejercicios están listos!',
+        `PDF con ${ejercicios.length || 20} ejercicios de "${ev.nombre}" disponible.`,
+        `/ramos/${ev.ramo_id}/plan/${req.params.id}`
+      )
     })
 
     // ── Colores (fondo blanco) ────────────────────────────────────
