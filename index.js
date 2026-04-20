@@ -31,13 +31,17 @@ const OpenAI = require('openai')
 // anteriores funcionaban igual (title+body+icon ≡ title+body+url desde el
 // SW). Pero centralizar previene divergencia futura y deja los logs más
 // comparables.
+// El default de url es absoluto: algunos usuarios quedaron suscritos desde
+// el viejo host apprueba-production.up.railway.app; con url relativa ('/')
+// el SW abría ese host stale. Forzando URL canónica apprueba.com, el tap
+// en la notificación siempre trae al dominio correcto.
 function buildPushPayload({ title, body, icon, badge, url } = {}) {
   return JSON.stringify({
     title: title || 'APPrueba',
     body: body || '',
     icon: icon || '/icon-192.png',
     badge: badge || '/icon-192.png',
-    url: url || '/'
+    url: url || 'https://apprueba.com'
   })
 }
 
@@ -50,15 +54,21 @@ function buildPushPayload({ title, body, icon, badge, url } = {}) {
 // al dispositivo. Si estas línea muestran 200/201 pero el usuario no ve
 // nada, el problema es del SW o de permisos del browser; si muestran
 // 403/404/410 es la suscripción; otros códigos sugieren config VAPID mala.
-async function enviarPushYLimpiar(row, payload) {
+async function enviarPushYLimpiar(row, payload, tag = 'push') {
   const s = row.subscription
   const endpointTail = s?.endpoint ? s.endpoint.slice(-30) : '(sin endpoint)'
+  // Inferir de qué push service es por prefijo del endpoint — útil para
+  // diagnosticar si admin manual llega a FCM/Mozilla pero no a Apple.
+  const service = s?.endpoint?.includes('fcm.googleapis.com') ? 'fcm'
+    : s?.endpoint?.includes('push.services.mozilla.com') ? 'mozilla'
+    : s?.endpoint?.includes('push.apple.com') ? 'apple'
+    : 'otro'
   try {
     const result = await webpush.sendNotification(
       { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
       payload
     )
-    console.log(`[push] OK sub#${row.id} …${endpointTail} status=${result?.statusCode}`)
+    console.log(`[${tag}] OK sub#${row.id} svc=${service} …${endpointTail} status=${result?.statusCode}`)
     return { ok: true, expired: false }
   } catch (err) {
     const code = err?.statusCode
@@ -66,16 +76,16 @@ async function enviarPushYLimpiar(row, payload) {
     // Loguea TODOS los errores, no solo 404/410. 403 suele indicar VAPID
     // equivocada (sospecha de rotación). 400 payload malformado. 429 rate
     // limit del push service. 500+ downtime del push service.
-    console.warn(`[push] FAIL sub#${row.id} …${endpointTail} status=${code ?? 'sin-code'} expired=${expired} msg=${err?.message || err}`)
+    console.warn(`[${tag}] FAIL sub#${row.id} svc=${service} …${endpointTail} status=${code ?? 'sin-code'} expired=${expired} msg=${err?.message || err}`)
     if (expired && row.id != null) {
       await pool.query('DELETE FROM push_subscriptions WHERE id = $1', [row.id]).catch(() => {})
-      console.log(`[push] sub#${row.id} eliminada (vencida)`)
+      console.log(`[${tag}] sub#${row.id} eliminada (vencida)`)
     }
     return { ok: false, expired }
   }
 }
 
-async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
+async function notificarUsuario(usuarioId, titulo, cuerpo, url) {
   try {
     const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
     const payload = buildPushPayload({ title: titulo, body: cuerpo, url })
@@ -630,18 +640,22 @@ async function initDB() {
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
   // Backfill/normaliza numero_registro de fundadores por orden de created_at.
-  // Antes el código solo leía la columna — nunca la asignaba — así que
-  // usuarios tenían números inconsistentes heredados de migraciones manuales
-  // (ej. "#96" sin haber 50 usuarios). Idempotente: correr varias veces no
-  // cambia nada si ya están ordenados.
+  // Backfill incremental: solo asigna numero_registro a fundadores que aún
+  // no lo tienen (NULL). Antes usaba ROW_NUMBER sobre TODOS los fundadores,
+  // lo cual revertía cualquier swap/ajuste manual en cada boot (ej. si Abel
+  // cede el #1 a otro, al próximo restart quedaba #1 de nuevo). Ahora el
+  // número de quien ya lo tiene se respeta; los nuevos sin número reciben
+  // el siguiente disponible según orden de created_at.
   await pool.query(`
-    UPDATE usuarios u SET numero_registro = sub.n
-    FROM (
-      SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) AS n
-      FROM usuarios WHERE es_fundador = TRUE
-    ) sub
-    WHERE u.id = sub.id AND u.es_fundador = TRUE
-      AND (u.numero_registro IS DISTINCT FROM sub.n)
+    WITH max_actual AS (
+      SELECT COALESCE(MAX(numero_registro), 0) AS n FROM usuarios WHERE es_fundador = TRUE
+    ),
+    pendientes AS (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) AS idx
+      FROM usuarios WHERE es_fundador = TRUE AND numero_registro IS NULL
+    )
+    UPDATE usuarios u SET numero_registro = (SELECT n FROM max_actual) + p.idx
+    FROM pendientes p WHERE u.id = p.id
   `)
   console.log('Base de datos lista ✅')
 }
@@ -2911,15 +2925,18 @@ app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async
     const { titulo, mensaje, url, icon, badge } = req.body
     const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions')
     const payload = buildPushPayload({ title: titulo, body: mensaje, url, icon, badge })
+    console.log(`[push-admin] broadcast → ${subs.length} subs, payload=${payload}`)
     let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
-      const r = await enviarPushYLimpiar(row, payload)
+      const r = await enviarPushYLimpiar(row, payload, 'push-admin')
       if (r.ok) enviadas++
       else if (r.expired) vencidas++
       else fallidas++
     }
+    console.log(`[push-admin] broadcast done · enviadas=${enviadas} vencidas=${vencidas} fallidas=${fallidas}`)
     res.json({ ok: true, enviadas, vencidas, fallidas, total: subs.length })
   } catch(e) {
+    console.error('[push-admin] broadcast error:', e)
     res.status(500).json({ error: e.message })
   }
 })
@@ -2936,16 +2953,18 @@ app.post('/admin/notificacion-individual', authenticateToken, requireAdmin, asyn
     )
     if (subs.length === 0) return res.json({ ok: true, enviadas: 0, vencidas: 0, fallidas: 0, total: 0, sin_push: true })
     const payload = buildPushPayload({ title: titulo, body: mensaje, url, icon, badge })
+    console.log(`[push-admin] individual uid=${usuario_id} → ${subs.length} subs, payload=${payload}`)
     let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
-      const r = await enviarPushYLimpiar(row, payload)
+      const r = await enviarPushYLimpiar(row, payload, 'push-admin')
       if (r.ok) enviadas++
       else if (r.expired) vencidas++
       else fallidas++
     }
+    console.log(`[push-admin] individual uid=${usuario_id} done · enviadas=${enviadas} vencidas=${vencidas} fallidas=${fallidas}`)
     res.json({ ok: true, enviadas, vencidas, fallidas, total: subs.length })
   } catch(e) {
-    console.error('Error notif individual:', e)
+    console.error('[push-admin] individual error:', e)
     res.status(500).json({ error: e.message })
   }
 })
@@ -3016,11 +3035,14 @@ cron.schedule('0 8 * * *', async () => {
         AND e.fecha >= CURRENT_DATE
     `)
 
+    // Medianoche en Chile — no en UTC. Sin esta conversión, ejecutar el
+    // cron a otra hora que no sea 8 AM Chile corre el riesgo de calcular
+    // diffDias contra el día equivocado (UTC está 3-4 h adelante).
+    const ahoraChile = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Santiago' }))
+    const hoyChile = new Date(ahoraChile.getFullYear(), ahoraChile.getMonth(), ahoraChile.getDate())
     for (const row of configs) {
       const fecha = new Date(row.fecha)
-      const hoy = new Date()
-      hoy.setHours(0,0,0,0)
-      const diffDias = Math.round((fecha - hoy) / (1000 * 60 * 60 * 24))
+      const diffDias = Math.round((fecha - hoyChile) / (1000 * 60 * 60 * 24))
 
       if (row.dias_antes.includes(diffDias)) {
         // Obtener subscriptions del usuario — el WHERE usuario_id = $1
@@ -3051,12 +3073,14 @@ cron.schedule('*/15 * * * *', async () => {
   try {
     const ahora = new Date()
     const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado']
-    const diaHoy = diasSemana[ahora.getDay()]
-    const horaAhora = ahora.toTimeString().slice(0,5)
-    
-    // Hora en 15 minutos
-    const en15 = new Date(ahora.getTime() + 15 * 60000)
-    const hora15 = en15.toTimeString().slice(0,5)
+    // Usar hora de Chile (America/Santiago), no UTC del servidor Railway
+    const ahoraChile = new Date(ahora.toLocaleString('en-US', { timeZone: 'America/Santiago' }))
+    const diaHoy = diasSemana[ahoraChile.getDay()]
+    const horaAhora = ahoraChile.toTimeString().slice(0,5)
+
+    // Hora en 15 minutos (en zona Chile)
+    const en15Chile = new Date(ahoraChile.getTime() + 15 * 60000)
+    const hora15 = en15Chile.toTimeString().slice(0,5)
 
     // Buscar clases que empiezan entre ahora y 15 min
     const { rows } = await pool.query(`
@@ -3106,8 +3130,10 @@ cron.schedule('*/30 7-22 * * *', async () => {
   try {
     const ahora = new Date()
     const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado']
-    const diaHoy = diasSemana[ahora.getDay()]
-    const horaAhora = ahora.toTimeString().slice(0,5)
+    // Usar hora de Chile (America/Santiago), no UTC del servidor Railway
+    const ahoraChile = new Date(ahora.toLocaleString('en-US', { timeZone: 'America/Santiago' }))
+    const diaHoy = diasSemana[ahoraChile.getDay()]
+    const horaAhora = ahoraChile.toTimeString().slice(0,5)
 
     const { rows: usuarios } = await pool.query(`
       SELECT nc.usuario_id
