@@ -26,6 +26,21 @@ const bcrypt = require('bcrypt')
 const OpenAI = require('openai')
 
 // Helper: enviar notificación push a usuario específico
+// Shape ÚNICA de payload para todas las pushes (crons internos + admin +
+// test). El SW tiene defaults para campos faltantes, así que los 7 callers
+// anteriores funcionaban igual (title+body+icon ≡ title+body+url desde el
+// SW). Pero centralizar previene divergencia futura y deja los logs más
+// comparables.
+function buildPushPayload({ title, body, icon, badge, url } = {}) {
+  return JSON.stringify({
+    title: title || 'APPrueba',
+    body: body || '',
+    icon: icon || '/icon-192.png',
+    badge: badge || '/icon-192.png',
+    url: url || '/'
+  })
+}
+
 // Envía una push a una fila de push_subscriptions. Si la suscripción está
 // vencida (404 Not Found o 410 Gone) la BORRA de la tabla — así el conteo
 // de "usuarios con push activo" deja de mentir con el tiempo.
@@ -63,7 +78,7 @@ async function enviarPushYLimpiar(row, payload) {
 async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
   try {
     const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
-    const payload = JSON.stringify({ title: titulo, body: cuerpo, url })
+    const payload = buildPushPayload({ title: titulo, body: cuerpo, url })
     for (const row of subs) {
       const r = await enviarPushYLimpiar(row, payload)
       if (!r.ok && !r.expired) console.error('Push error (no-expired) user', usuarioId)
@@ -2893,9 +2908,9 @@ app.post('/notificaciones/config', authenticateToken, async (req, res) => {
 app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
-    const { titulo, mensaje, url } = req.body
+    const { titulo, mensaje, url, icon, badge } = req.body
     const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions')
-    const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
+    const payload = buildPushPayload({ title: titulo, body: mensaje, url, icon, badge })
     let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
       const r = await enviarPushYLimpiar(row, payload)
@@ -2913,14 +2928,14 @@ app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async
 app.post('/admin/notificacion-individual', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
-    const { usuario_id, titulo, mensaje, url } = req.body
+    const { usuario_id, titulo, mensaje, url, icon, badge } = req.body
     if (!usuario_id) return res.status(400).json({ error: 'usuario_id requerido' })
     const { rows: subs } = await pool.query(
       'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
       [usuario_id]
     )
     if (subs.length === 0) return res.json({ ok: true, enviadas: 0, vencidas: 0, fallidas: 0, total: 0, sin_push: true })
-    const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
+    const payload = buildPushPayload({ title: titulo, body: mensaje, url, icon, badge })
     let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
       const r = await enviarPushYLimpiar(row, payload)
@@ -3021,7 +3036,7 @@ cron.schedule('0 8 * * *', async () => {
           : diffDias === 1
           ? `Mañana tienes ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
           : `En ${diffDias} días: ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
-        const payload = JSON.stringify({ title: '📚 APPrueba', body: mensaje, icon: '/icon-192.png' })
+        const payload = buildPushPayload({ title: '📚 APPrueba', body: mensaje })
         for (const sub of subs) await enviarPushYLimpiar(sub, payload)
       }
     }
@@ -3076,7 +3091,7 @@ cron.schedule('*/15 * * * *', async () => {
       const tipoEmoji = row.tipo === 'topon' ? '⚡' : row.tipo === 'ayudantia' ? '🙋' : '🏫'
       const sala = row.sala ? ` · ${row.sala}` : ''
       const mensaje = `${row.ramo_nombre} empieza a las ${row.hora_inicio}${sala}`
-      const payload = JSON.stringify({ title: `${tipoEmoji} Clase en 15 minutos`, body: mensaje, icon: '/icon-192.png' })
+      const payload = buildPushPayload({ title: `${tipoEmoji} Clase en 15 minutos`, body: mensaje })
       for (const sub of subs) await enviarPushYLimpiar(sub, payload)
     }
   } catch(err) {
@@ -3157,10 +3172,9 @@ cron.schedule('*/30 7-22 * * *', async () => {
         'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
         [u.usuario_id]
       )
-      const payload = JSON.stringify({
+      const payload = buildPushPayload({
         title: '📖 Ventana de estudio',
-        body: `Tienes ${durTexto} libres desde las ${proxVentana.desde} hasta las ${proxVentana.hasta}. ¡Buen momento para estudiar!`,
-        icon: '/icon-192.png'
+        body: `Tienes ${durTexto} libres desde las ${proxVentana.desde} hasta las ${proxVentana.hasta}. ¡Buen momento para estudiar!`
       })
       for (const sub of subs) await enviarPushYLimpiar(sub, payload)
     }
@@ -4057,9 +4071,9 @@ app.post('/notificaciones/test', authenticateToken, async (req, res) => {
     )
     if (subs.length === 0) return res.json({ ok: false, msg: 'No tienes subscripción push registrada' })
     const tipo = req.body.tipo || 'clase'
-    const payload = JSON.stringify(tipo === 'clase'
-      ? { title: '🏫 Clase en 15 minutos', body: 'Álgebra Lineal empieza a las 14:30 · Sala B-101', icon: '/icon-192.png' }
-      : { title: '📖 Ventana de estudio disponible', body: 'Tienes 2h libres de 10:00 a 12:00 · Aprovecha para estudiar Física II', icon: '/icon-192.png' })
+    const payload = tipo === 'clase'
+      ? buildPushPayload({ title: '🏫 Clase en 15 minutos', body: 'Álgebra Lineal empieza a las 14:30 · Sala B-101' })
+      : buildPushPayload({ title: '📖 Ventana de estudio disponible', body: 'Tienes 2h libres de 10:00 a 12:00 · Aprovecha para estudiar Física II' })
     let enviadas = 0, vencidas = 0
     for (const sub of subs) {
       const r = await enviarPushYLimpiar(sub, payload)
