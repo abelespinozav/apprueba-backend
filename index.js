@@ -1613,6 +1613,125 @@ async function refrescarNovedadesInacap() {
 
 cron.schedule('45 */2 * * *', refrescarNovedadesInacap, { timezone: 'America/Santiago' })
 
+// Scrape Santo Tomás. WP REST abierto, mismo patrón que UFRO.
+async function scrapeSantoTomasNovedades() {
+  const axios = require('axios')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const wp = axios.get(
+    'https://www.santotomas.cl/wp-json/wp/v2/posts?per_page=6&_fields=title,excerpt,date,link',
+    { timeout: 8000, headers: ua }
+  ).then(({ data: posts }) => {
+    const items = []
+    for (const post of posts) {
+      const titulo = post.title?.rendered?.replace(/&#[0-9]+;/g, '').replace(/<[^>]+>/g, '').trim()
+      const desc = post.excerpt?.rendered?.replace(/<[^>]+>/g, '').replace(/\n/g, ' ').trim().slice(0, 80)
+      if (!titulo) continue
+      items.push({
+        tipo: 'Noticia', emoji: '📰',
+        titulo: titulo.slice(0, 75),
+        descripcion: desc ? desc.slice(0, 70) : 'Santo Tomás · Noticias',
+        color: '#60a5fa',
+        link: post.link
+      })
+    }
+    return items
+  })
+
+  const results = await Promise.allSettled([wp, scrapeJunaeb()])
+  const labels = ['UST WP REST', 'JUNAEB']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 8)
+}
+
+async function refrescarNovedadesSantoTomas() {
+  try {
+    const items = await scrapeSantoTomasNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'santotomas' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('santotomas', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('santotomas', items)
+    console.log(`📰 Novedades Santo Tomás refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades Santo Tomás:', err.message)
+  }
+}
+
+cron.schedule('50 */2 * * *', refrescarNovedadesSantoTomas, { timezone: 'America/Santiago' })
+
+// Scrape UCT (Temuco). WP REST 404 pero /feed/ sirve RSS 2.0.
+// OJO: es U. Católica de Temuco (uct.cl), NO la PUC.
+// El <description> del feed es basura generada ("The post X appeared first on UCT"),
+// se descarta y se usa la categoría como descripción corta.
+async function scrapeUctNovedades() {
+  const axios = require('axios')
+  const cheerio = require('cheerio')
+  const ua = { 'User-Agent': 'Mozilla/5.0' }
+
+  const rss = axios.get(
+    'https://www.uct.cl/feed/',
+    { timeout: 10000, headers: ua }
+  ).then(({ data: xml }) => {
+    const $ = cheerio.load(xml, { xmlMode: true })
+    const items = []
+    $('item').each((_, el) => {
+      if (items.length >= 6) return
+      const $el = $(el)
+      const titulo = $el.find('title').first().text().trim().replace(/\s+/g, ' ')
+      const link = $el.find('link').first().text().trim()
+      const categoria = $el.find('category').first().text().trim()
+      if (!titulo || !link) return
+      items.push({
+        tipo: categoria && categoria.toLowerCase() !== 'actualidad' ? categoria.slice(0, 25) : 'Noticia',
+        emoji: '📰',
+        titulo: titulo.slice(0, 75),
+        descripcion: (categoria ? `UCT · ${categoria}` : 'UCT · Temuco').slice(0, 70),
+        color: '#60a5fa',
+        link
+      })
+    })
+    return items
+  })
+
+  const results = await Promise.allSettled([rss, scrapeJunaeb()])
+  const labels = ['UCT RSS', 'JUNAEB']
+  const novedades = []
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') novedades.push(...r.value)
+    else console.log(`${labels[i]} scraping falló:`, r.reason?.message)
+  })
+  return novedades.slice(0, 8)
+}
+
+async function refrescarNovedadesUct() {
+  try {
+    const items = await scrapeUctNovedades()
+    if (items.length === 0) return
+    await pool.query("DELETE FROM novedades WHERE universidad = 'uctemuco' AND origen = 'scrape'")
+    for (const n of items) {
+      await pool.query(
+        "INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen) VALUES ('uctemuco', $1, $2, $3, $4, $5, 'scrape')",
+        [n.tipo, n.emoji, n.titulo, n.descripcion, n.color]
+      )
+    }
+    setCachedNovedades('uctemuco', items)
+    console.log(`📰 Novedades UCT Temuco refrescadas (${items.length} items)`)
+  } catch (err) {
+    console.error('❌ Error refrescando novedades UCT Temuco:', err.message)
+  }
+}
+
+cron.schedule('55 */2 * * *', refrescarNovedadesUct, { timezone: 'America/Santiago' })
+
 app.get('/novedades', authenticateToken, async (req, res) => {
   try {
     // La universidad se deriva del usuario autenticado, NO del query string.
@@ -1638,7 +1757,9 @@ app.get('/novedades', authenticateToken, async (req, res) => {
       ufro: scrapeUfroNovedades,
       umayor: scrapeMayorNovedades,
       uautonoma: scrapeAutonomaNovedades,
-      inacap: scrapeInacapNovedades
+      inacap: scrapeInacapNovedades,
+      santotomas: scrapeSantoTomasNovedades,
+      uctemuco: scrapeUctNovedades
     }
     if (scrapers[uni]) {
       const cached = getCachedNovedades(uni)
