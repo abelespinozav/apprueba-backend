@@ -26,18 +26,35 @@ const bcrypt = require('bcrypt')
 const OpenAI = require('openai')
 
 // Helper: enviar notificación push a usuario específico
+// Envía una push a una fila de push_subscriptions. Si la suscripción está
+// vencida (404 Not Found o 410 Gone) la BORRA de la tabla — así el conteo
+// de "usuarios con push activo" deja de mentir con el tiempo.
+// Devuelve { ok, expired } para que el caller agrupe métricas.
+async function enviarPushYLimpiar(row, payload) {
+  const s = row.subscription
+  try {
+    await webpush.sendNotification(
+      { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
+      payload
+    )
+    return { ok: true, expired: false }
+  } catch (err) {
+    const code = err?.statusCode
+    const expired = code === 404 || code === 410
+    if (expired && row.id != null) {
+      await pool.query('DELETE FROM push_subscriptions WHERE id = $1', [row.id]).catch(() => {})
+    }
+    return { ok: false, expired }
+  }
+}
+
 async function notificarUsuario(usuarioId, titulo, cuerpo, url = '/') {
   try {
-    const { rows: subs } = await pool.query('SELECT subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
+    const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1', [usuarioId])
     const payload = JSON.stringify({ title: titulo, body: cuerpo, url })
     for (const row of subs) {
-      try {
-        const s = row.subscription
-        await webpush.sendNotification(
-          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
-          payload
-        )
-      } catch(e) { console.error('Push error:', e.message) }
+      const r = await enviarPushYLimpiar(row, payload)
+      if (!r.ok && !r.expired) console.error('Push error (no-expired) user', usuarioId)
     }
   } catch(e) { console.error('notificarUsuario error:', e.message) }
 }
@@ -2797,6 +2814,20 @@ app.post('/notificaciones/subscribe', authenticateToken, async (req, res) => {
        ON CONFLICT DO NOTHING`,
       [req.user.id, JSON.stringify(subscription)]
     )
+    // Cap a 3 suscripciones por usuario — el mismo navegador puede generar
+    // endpoints nuevos al reinstalar la PWA o rotar claves, y sin límite
+    // se acumulan (un tester llegó a 14 activas). Conservamos las 3 más
+    // recientes; las viejas casi siempre están vencidas de todos modos.
+    await pool.query(
+      `DELETE FROM push_subscriptions
+       WHERE usuario_id = $1 AND id NOT IN (
+         SELECT id FROM push_subscriptions
+         WHERE usuario_id = $1
+         ORDER BY created_at DESC
+         LIMIT 3
+       )`,
+      [req.user.id]
+    )
     res.json({ ok: true })
   } catch(err) { res.status(500).json({ error: err.message }) }
 })
@@ -2842,20 +2873,16 @@ app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const { titulo, mensaje, url } = req.body
-    const { rows: subs } = await pool.query('SELECT subscription FROM push_subscriptions')
+    const { rows: subs } = await pool.query('SELECT id, subscription FROM push_subscriptions')
     const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
-    let enviadas = 0, fallidas = 0
+    let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
-      try {
-        const s = row.subscription
-        await webpush.sendNotification(
-          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
-          payload
-        )
-        enviadas++
-      } catch(e) { fallidas++ }
+      const r = await enviarPushYLimpiar(row, payload)
+      if (r.ok) enviadas++
+      else if (r.expired) vencidas++
+      else fallidas++
     }
-    res.json({ ok: true, enviadas, fallidas, total: subs.length })
+    res.json({ ok: true, enviadas, vencidas, fallidas, total: subs.length })
   } catch(e) {
     res.status(500).json({ error: e.message })
   }
@@ -2868,23 +2895,19 @@ app.post('/admin/notificacion-individual', authenticateToken, requireAdmin, asyn
     const { usuario_id, titulo, mensaje, url } = req.body
     if (!usuario_id) return res.status(400).json({ error: 'usuario_id requerido' })
     const { rows: subs } = await pool.query(
-      'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+      'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
       [usuario_id]
     )
-    if (subs.length === 0) return res.json({ ok: true, enviadas: 0, fallidas: 0, total: 0, sin_push: true })
+    if (subs.length === 0) return res.json({ ok: true, enviadas: 0, vencidas: 0, fallidas: 0, total: 0, sin_push: true })
     const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
-    let enviadas = 0, fallidas = 0
+    let enviadas = 0, vencidas = 0, fallidas = 0
     for (const row of subs) {
-      try {
-        const s = row.subscription
-        await webpush.sendNotification(
-          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
-          payload
-        )
-        enviadas++
-      } catch(e) { fallidas++ }
+      const r = await enviarPushYLimpiar(row, payload)
+      if (r.ok) enviadas++
+      else if (r.expired) vencidas++
+      else fallidas++
     }
-    res.json({ ok: true, enviadas, fallidas, total: subs.length })
+    res.json({ ok: true, enviadas, vencidas, fallidas, total: subs.length })
   } catch(e) {
     console.error('Error notif individual:', e)
     res.status(500).json({ error: e.message })
@@ -2964,34 +2987,21 @@ cron.schedule('0 8 * * *', async () => {
       const diffDias = Math.round((fecha - hoy) / (1000 * 60 * 60 * 24))
 
       if (row.dias_antes.includes(diffDias)) {
-        // Obtener subscriptions del usuario
+        // Obtener subscriptions del usuario — el WHERE usuario_id = $1
+        // garantiza que cada push va SOLO a su dueño. El JOIN del SELECT
+        // principal es nc→usuarios→ramos→evaluaciones, todos scoped por
+        // usuario_id, sin cross-contamination.
         const { rows: subs } = await pool.query(
-          'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+          'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
           [row.usuario_id]
         )
-
         const mensaje = diffDias === 0
           ? `¡Hoy es ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)!`
           : diffDias === 1
           ? `Mañana tienes ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
           : `En ${diffDias} días: ${row.eval_nombre} de ${row.ramo_nombre} (${row.ponderacion}%)`
-
-        for (const sub of subs) {
-          try {
-            await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}},
-              JSON.stringify({
-                title: '📚 APPrueba',
-                body: mensaje,
-                icon: '/icon-192.png'
-              })
-            )
-          } catch(e) {
-            if (e.statusCode === 410) {
-              // Subscription expirada, eliminar
-              await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
-            }
-          }
-        }
+        const payload = JSON.stringify({ title: '📚 APPrueba', body: mensaje, icon: '/icon-192.png' })
+        for (const sub of subs) await enviarPushYLimpiar(sub, payload)
       }
     }
     console.log('✅ Cron notificaciones completado')
@@ -3036,27 +3046,17 @@ cron.schedule('*/15 * * * *', async () => {
         if (e.code === '23505') continue
         throw e
       }
+      // SELECT dentro del loop por usuario — el query principal (horario)
+      // ya está scoped a row.usuario_id, así que cada sub va a su dueño.
       const { rows: subs } = await pool.query(
-        'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+        'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
         [row.usuario_id]
       )
       const tipoEmoji = row.tipo === 'topon' ? '⚡' : row.tipo === 'ayudantia' ? '🙋' : '🏫'
       const sala = row.sala ? ` · ${row.sala}` : ''
       const mensaje = `${row.ramo_nombre} empieza a las ${row.hora_inicio}${sala}`
-
-      for (const sub of subs) {
-        try {
-          await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify({
-            title: `${tipoEmoji} Clase en 15 minutos`,
-            body: mensaje,
-            icon: '/icon-192.png'
-          }))
-        } catch(e) {
-          if (e.statusCode === 410) {
-            await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
-          }
-        }
-      }
+      const payload = JSON.stringify({ title: `${tipoEmoji} Clase en 15 minutos`, body: mensaje, icon: '/icon-192.png' })
+      for (const sub of subs) await enviarPushYLimpiar(sub, payload)
     }
   } catch(err) {
     console.error('❌ Error cron clases próximas:', err.message)
@@ -3133,26 +3133,15 @@ cron.schedule('*/30 7-22 * * *', async () => {
         : `${durMins}min`
 
       const { rows: subs } = await pool.query(
-        'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+        'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
         [u.usuario_id]
       )
-
-      for (const sub of subs) {
-        try {
-          await webpush.sendNotification(
-            { endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: { p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth } },
-            JSON.stringify({
-              title: '📖 Ventana de estudio',
-              body: `Tienes ${durTexto} libres desde las ${proxVentana.desde} hasta las ${proxVentana.hasta}. ¡Buen momento para estudiar!`,
-              icon: '/icon-192.png'
-            })
-          )
-        } catch(e) {
-          if (e.statusCode === 410) {
-            await pool.query('DELETE FROM push_subscriptions WHERE subscription = $1', [JSON.stringify(sub.subscription)])
-          }
-        }
-      }
+      const payload = JSON.stringify({
+        title: '📖 Ventana de estudio',
+        body: `Tienes ${durTexto} libres desde las ${proxVentana.desde} hasta las ${proxVentana.hasta}. ¡Buen momento para estudiar!`,
+        icon: '/icon-192.png'
+      })
+      for (const sub of subs) await enviarPushYLimpiar(sub, payload)
     }
   } catch(err) {
     console.error('❌ Error cron ventanas dinámico:', err.message)
@@ -4042,26 +4031,21 @@ Responde SOLO con JSON válido:
 app.post('/notificaciones/test', authenticateToken, async (req, res) => {
   try {
     const { rows: subs } = await pool.query(
-      'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+      'SELECT id, subscription FROM push_subscriptions WHERE usuario_id = $1',
       [req.user.id]
     )
     if (subs.length === 0) return res.json({ ok: false, msg: 'No tienes subscripción push registrada' })
-    
     const tipo = req.body.tipo || 'clase'
-    let payload
-    if (tipo === 'clase') {
-      payload = { title: '🏫 Clase en 15 minutos', body: 'Álgebra Lineal empieza a las 14:30 · Sala B-101', icon: '/icon-192.png' }
-    } else {
-      payload = { title: '📖 Ventana de estudio disponible', body: 'Tienes 2h libres de 10:00 a 12:00 · Aprovecha para estudiar Física II', icon: '/icon-192.png' }
-    }
-
-    let enviadas = 0
-    console.log("SUB DEBUG:", typeof subs[0].subscription, JSON.stringify(subs[0].subscription).slice(0,100))
+    const payload = JSON.stringify(tipo === 'clase'
+      ? { title: '🏫 Clase en 15 minutos', body: 'Álgebra Lineal empieza a las 14:30 · Sala B-101', icon: '/icon-192.png' }
+      : { title: '📖 Ventana de estudio disponible', body: 'Tienes 2h libres de 10:00 a 12:00 · Aprovecha para estudiar Física II', icon: '/icon-192.png' })
+    let enviadas = 0, vencidas = 0
     for (const sub of subs) {
-      await webpush.sendNotification({endpoint: sub.subscription.endpoint, expirationTime: sub.subscription.expirationTime, keys: {p256dh: sub.subscription.keys.p256dh, auth: sub.subscription.keys.auth}}, JSON.stringify(payload))
-      enviadas++
+      const r = await enviarPushYLimpiar(sub, payload)
+      if (r.ok) enviadas++
+      else if (r.expired) vencidas++
     }
-    res.json({ ok: true, enviadas, payload })
+    res.json({ ok: true, enviadas, vencidas })
   } catch(err) {
     res.status(500).json({ ok: false, error: err.message })
   }
