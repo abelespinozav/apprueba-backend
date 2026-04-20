@@ -2829,6 +2829,60 @@ app.post('/admin/notificacion-broadcast', authenticateToken, requireAdmin, async
   }
 })
 
+// Notificación individual a un usuario específico
+app.post('/admin/notificacion-individual', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { usuario_id, titulo, mensaje, url } = req.body
+    if (!usuario_id) return res.status(400).json({ error: 'usuario_id requerido' })
+    const { rows: subs } = await pool.query(
+      'SELECT subscription FROM push_subscriptions WHERE usuario_id = $1',
+      [usuario_id]
+    )
+    if (subs.length === 0) return res.json({ ok: true, enviadas: 0, fallidas: 0, total: 0, sin_push: true })
+    const payload = JSON.stringify({ title: titulo || 'APPrueba', body: mensaje || '', url: url || '/' })
+    let enviadas = 0, fallidas = 0
+    for (const row of subs) {
+      try {
+        const s = row.subscription
+        await webpush.sendNotification(
+          { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
+          payload
+        )
+        enviadas++
+      } catch(e) { fallidas++ }
+    }
+    res.json({ ok: true, enviadas, fallidas, total: subs.length })
+  } catch(e) {
+    console.error('Error notif individual:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// Estadísticas de suscripciones push (para el panel admin)
+app.get('/admin/push-stats', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM usuarios) AS total_usuarios,
+        (SELECT COUNT(DISTINCT usuario_id) FROM push_subscriptions) AS con_push,
+        (SELECT COUNT(*) FROM push_subscriptions) AS subscriptions_total
+    `)
+    const r = rows[0]
+    const total = parseInt(r.total_usuarios)
+    const conPush = parseInt(r.con_push)
+    res.json({
+      total_usuarios: total,
+      con_push: conPush,
+      sin_push: Math.max(0, total - conPush),
+      subscriptions_total: parseInt(r.subscriptions_total)
+    })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 
 // Cuántos spots de fundador quedan
 
