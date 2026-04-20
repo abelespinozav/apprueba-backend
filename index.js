@@ -2063,16 +2063,39 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     return e
   }
 
-  const CASINO_PROMPT = 'Esta es una foto del menú del casino de la UFRO de hoy. '
-    + 'Extrae los platos del día (entrada, plato de fondo, acompañamiento, postre, y vegetariano si aparece). '
-    + 'Devuelve SOLO un JSON con esta estructura exacta: '
-    + '{"platos":["Entrada: <nombre real>","Fondo: <nombre real>","Acompañamiento: <nombre real>","Postre: <nombre real>","Vegetariano: <nombre real>"],"destacado":"<nombre del plato de fondo principal, tal cual aparece en el menú>"}. '
-    + 'REGLAS ESTRICTAS: '
-    + '(1) "destacado" DEBE ser el nombre literal de un plato concreto del menú (p.ej. "Ragout de pollo"), NUNCA una frase genérica como "Plato estrella del día" o "Plato principal". '
-    + '(2) Si no logras identificar un plato de fondo específico, devuelve "destacado":"". '
-    + '(3) NO inventes platos. Si un campo (entrada/postre/etc.) no aparece en la foto, omítelo del arreglo — no generes placeholders. '
-    + '(4) No repitas el mismo plato en varias entradas del arreglo. '
-    + 'Si la imagen NO es un menú de casino, devuelve {"platos":[],"destacado":""}.'
+  // El casino publica VARIOS menús por día (BAES, BAES mejorado, Ejecutivo,
+  // Hipocalórico, Vegetariano, Vegano — los nombres varían según la sede/día).
+  // El prompt anterior extraía sólo "Entrada/Fondo/Postre" asumiendo UN menú,
+  // ignoraba los tipos y los precios. Este prompt pide TODOS los menús con
+  // su precio y componentes, para que Apprueba muestre la oferta completa.
+  const CASINO_PROMPT = [
+    'Esta es la foto del menú del casino UFRO de hoy. El casino publica MÚLTIPLES',
+    'menús en la misma pizarra/afiche: típicamente BAES, BAES mejorado, Ejecutivo,',
+    'Hipocalórico, Vegetariano y/o Vegano — pero los nombres exactos pueden',
+    'variar. Cada menú tiene un precio y una lista de platos/componentes',
+    '(entrada, fondo, acompañamiento, postre).',
+    '',
+    'Tarea: identifica CADA menú presente en la imagen y devuelve SOLO un',
+    'JSON con esta estructura exacta:',
+    '{"menus":[{"nombre":"BAES","precio":"$2.350","platos":["Porotos con rienda","Fruta natural"]},{"nombre":"Ejecutivo","precio":"$3.790","platos":["Porotos con rienda","Hamburguesa de carne con arroz primavera"]}]}',
+    '',
+    'REGLAS ESTRICTAS:',
+    '(1) Incluye TODOS los menús visibles, no solo el principal. Si ves 5',
+    '    menús en la pizarra, el arreglo "menus" tiene 5 elementos.',
+    '(2) "nombre": texto del menú tal como aparece, sin el prefijo "Menú"',
+    '    (ej. "BAES", "Ejecutivo", "Hipocalórico", "Vegetariano", "Vegano").',
+    '(3) "precio": monto exacto con símbolo $ y separadores que aparezcan',
+    '    (ej. "$2.350", "$3.790"). Si no hay precio visible para ese menú,',
+    '    usa "".',
+    '(4) "platos": cada componente como string separado (no concatenes con',
+    '    comas en un solo string). Lista cada plato/postre/acompañamiento',
+    '    como elemento independiente del arreglo.',
+    '(5) NO inventes menús ni platos. Si no lees claramente uno, omítelo.',
+    '(6) Mantén nombres y precios tal cual los ves — no traduzcas ni',
+    '    parafrasees.',
+    '',
+    'Si la imagen NO es un menú de casino, devuelve {"menus":[]}.'
+  ].join(' ')
 
   bot.on('photo', async (msg) => {
     const chatId = msg.chat.id
@@ -2113,20 +2136,31 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 
       const raw = visionResp.choices[0].message.content
       let parsed
-      try { parsed = JSON.parse(raw) } catch (_) { parsed = { platos: [], destacado: '' } }
+      try { parsed = JSON.parse(raw) } catch (_) { parsed = { menus: [] } }
 
-      if (!Array.isArray(parsed.platos) || parsed.platos.length === 0) {
-        await bot.sendMessage(chatId, '🤔 No detecté platos en esta imagen. ¿Es realmente el menú del casino?')
+      const menus = Array.isArray(parsed.menus) ? parsed.menus.filter(m => m && m.nombre) : []
+      if (menus.length === 0) {
+        await bot.sendMessage(chatId, '🤔 No detecté menús en esta imagen. ¿Es realmente el menú del casino?')
         return
       }
 
-      const platosUnicos = Array.from(new Set(
-        parsed.platos.map(p => String(p).trim()).filter(Boolean)
-      ))
-      const descripcion = platosUnicos.join(' · ').slice(0, 500)
-      const titulo = parsed.destacado
-        ? `🍽️ Menú · ${String(parsed.destacado).slice(0, 60)}`
-        : '🍽️ Menú del casino hoy'
+      // Formato: "BAES $2.350: Porotos con rienda + Fruta natural · Ejecutivo $3.790: ..."
+      // Platos dentro de un menú se unen con " + "; menús entre sí con " · ".
+      const partes = menus.map(m => {
+        const nombre = String(m.nombre).trim()
+        const precio = m.precio ? ` ${String(m.precio).trim()}` : ''
+        const platos = Array.isArray(m.platos)
+          ? m.platos.map(p => String(p).trim()).filter(Boolean)
+          : []
+        const platosTxt = platos.length > 0 ? `: ${platos.join(' + ')}` : ''
+        return `${nombre}${precio}${platosTxt}`
+      }).filter(Boolean)
+      const descripcion = partes.join(' · ').slice(0, 500)
+
+      // Título compacto — el detalle va en descripción.
+      const titulo = menus.length === 1
+        ? `🍽️ Menú · ${String(menus[0].nombre).slice(0, 60)}`
+        : `🍽️ Casino hoy · ${menus.length} menús`
 
       // Guardar preview en memoria — espera confirmación del usuario
       pendingCasino.set(chatId, { titulo, descripcion, createdAt: Date.now() })
