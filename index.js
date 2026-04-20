@@ -571,10 +571,18 @@ async function initDB() {
   console.log('Base de datos lista ✅')
 }
 
+// GOOGLE_CALLBACK_URL debe estar seteada explícitamente — antes había un
+// fallback a localhost:3001 que dirigía OAuth en prod al lugar equivocado
+// si la env var se olvidaba en el deploy.
+if (!process.env.GOOGLE_CALLBACK_URL) {
+  console.error('❌ FATAL: GOOGLE_CALLBACK_URL no está seteada. Setéala en las env vars (ej. https://api.apprueba.com/auth/google/callback para prod, http://localhost:3001/auth/google/callback para dev).')
+  process.exit(1)
+}
+
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3001/auth/google/callback'
+  callbackURL: process.env.GOOGLE_CALLBACK_URL
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     // Verificar si ya existe
