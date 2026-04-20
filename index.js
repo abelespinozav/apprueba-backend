@@ -663,6 +663,9 @@ app.post('/auth/login', async (req, res) => {
     const usuario = result.rows[0]
     const ok = await bcrypt.compare(password, usuario.password_hash)
     if (!ok) return res.status(400).json({ error: 'Email o contraseña incorrectos' })
+    // Actualiza last_login: métricas del panel admin (DAU, activos hoy) lo
+    // usan y antes solo se refrescaba en el flujo Google OAuth.
+    await pool.query('UPDATE usuarios SET last_login = NOW() WHERE id = $1', [usuario.id]).catch(()=>{})
     const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
     res.json({ token, usuario: { id: usuario.id, nombre: usuario.nombre, email: usuario.email, avatar: usuario.avatar } })
   } catch (err) {
@@ -703,6 +706,10 @@ function buildBadge(email, esFundador, numeroRegistro) {
 }
 
 app.get('/auth/me', authenticateToken, async (req, res) => {
+  // Refresca last_login en cada re-hidratación: sin esto, usuarios con
+  // sesión válida de 7 días nunca aparecen como "activos hoy" aunque sí
+  // estén usando la app, y los DAU del panel admin quedan subestimados.
+  await pool.query('UPDATE usuarios SET last_login = NOW() WHERE id = $1', [req.user.id]).catch(()=>{})
   const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
@@ -2423,10 +2430,25 @@ app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (
 app.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
+    // Antes solo traía id/nombre/email/timestamps/contadores, pero el frontend
+    // necesita universidad, es_fundador, numero_registro, onboarding_v2 y
+    // ramos_count para decidir la columna "Universidad", el badge de estado
+    // y el filtro "Sin onboarding". Sin estos campos toda la tabla mostraba
+    // "Sin onboarding" para cualquier usuario real.
     const usuarios = await pool.query(`
-      SELECT id, nombre, email, created_at, last_login, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados
-      FROM usuarios
-      ORDER BY created_at DESC
+      SELECT u.id, u.nombre, u.email, u.universidad, u.carrera,
+             u.created_at, u.last_login,
+             u.podcasts_usados, u.ejercicios_usados, u.quizzes_usados, u.planes_usados,
+             u.es_fundador, u.numero_registro,
+             u.onboarding_v2, u.onboarding_completado,
+             COALESCE(r.ramos_count, 0)::int AS ramos_count
+      FROM usuarios u
+      LEFT JOIN (
+        SELECT usuario_id, COUNT(*) AS ramos_count
+        FROM ramos
+        GROUP BY usuario_id
+      ) r ON r.usuario_id = u.id
+      ORDER BY u.created_at DESC
     `)
     const stats = await pool.query(`
       SELECT
@@ -2521,8 +2543,34 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (re
   if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
   try {
     const uid = req.params.id
+
+    // El modal del frontend lee d.usuario?.nombre / email / universidad /
+    // carrera / created_at / last_login. Antes no se devolvía nada sobre el
+    // usuario y el modal mostraba "—" en todos los campos.
+    const { rows: usuarioRows } = await pool.query(`
+      SELECT id, nombre, email, universidad, carrera, avatar,
+             created_at, last_login,
+             es_fundador, numero_registro,
+             onboarding_v2, onboarding_completado,
+             podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados
+      FROM usuarios WHERE id = $1
+    `, [uid])
+    if (usuarioRows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' })
+    const usuario = usuarioRows[0]
+
+    // Además de las evaluaciones en array, añado evaluaciones_count y
+    // promedio ponderado — el modal los pinta por ramo.
     const { rows: ramos } = await pool.query(`
       SELECT r.id, r.nombre, r.min_aprobacion,
+        COUNT(e.id)::int AS evaluaciones_count,
+        CASE
+          WHEN SUM(CASE WHEN e.nota IS NOT NULL THEN e.ponderacion ELSE 0 END) > 0
+          THEN ROUND(
+            (SUM(e.nota * e.ponderacion) FILTER (WHERE e.nota IS NOT NULL)
+             / NULLIF(SUM(CASE WHEN e.nota IS NOT NULL THEN e.ponderacion END), 0))::numeric
+          , 1)
+          ELSE NULL
+        END AS promedio,
         json_agg(
           json_build_object(
             'id', e.id,
@@ -2555,7 +2603,7 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (re
 
     const limiteRes = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limiteGlobal = limiteRes.rows.length ? parseInt(limiteRes.rows[0].valor) : 100
-    res.json({ ramos, podcasts, limiteGlobal })
+    res.json({ usuario, ramos, podcasts, limiteGlobal })
   } catch(err) { console.error('ERROR DETALLE:', err.message); res.status(500).json({ error: err.message }) }
 })
 
