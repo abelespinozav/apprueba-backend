@@ -66,9 +66,15 @@ async function enviarPushYLimpiar(row, payload, tag = 'push') {
   try {
     const result = await webpush.sendNotification(
       { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
-      payload
+      payload,
+      // TTL 24h: si el dispositivo está offline, FCM/APNS guarda el mensaje
+      // hasta 86400s. urgency:high le dice al push service que priorice la
+      // entrega (reduce latencia y chance de coalescing en Android).
+      { TTL: 86400, urgency: 'high' }
     )
-    console.log(`[${tag}] OK sub#${row.id} svc=${service} …${endpointTail} status=${result?.statusCode}`)
+    // 201 de FCM = "queued para entrega", no "entregado al dispositivo".
+    // Dejamos el status crudo en el log para no mentir al diagnosticar.
+    console.log(`[${tag}] QUEUED sub#${row.id} svc=${service} …${endpointTail} status=${result?.statusCode}`)
     return { ok: true, expired: false }
   } catch (err) {
     const code = err?.statusCode
