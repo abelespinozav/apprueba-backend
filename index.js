@@ -818,14 +818,19 @@ app.post('/ramos', authenticateToken, async (req, res) => {
 })
 
 app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
-  const { nota } = req.body
-  const { rowCount } = await pool.query(
-    `UPDATE evaluaciones SET nota = $1
-     WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
-    [nota || null, req.params.id, req.user.id]
-  )
-  if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
-  res.json({ ok: true })
+  try {
+    const { nota } = req.body
+    const { rowCount } = await pool.query(
+      `UPDATE evaluaciones SET nota = $1
+       WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
+      [nota || null, req.params.id, req.user.id]
+    )
+    if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Error actualizando nota:', err)
+    res.status(500).json({ error: 'Error al guardar la nota' })
+  }
 })
 
 app.delete('/ramos/limpiar-todos', authenticateToken, async (req, res) => {
@@ -836,8 +841,13 @@ app.delete('/ramos/limpiar-todos', authenticateToken, async (req, res) => {
 })
 
 app.delete('/ramos/:id', authenticateToken, async (req, res) => {
-  await pool.query('DELETE FROM ramos WHERE id = $1 AND usuario_id = $2', [req.params.id, req.user.id])
-  res.json({ ok: true })
+  try {
+    await pool.query('DELETE FROM ramos WHERE id = $1 AND usuario_id = $2', [req.params.id, req.user.id])
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Error eliminando ramo:', err)
+    res.status(500).json({ error: 'Error al eliminar el ramo' })
+  }
 })
 
 // Subir archivo
@@ -873,21 +883,39 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
 
 // Eliminar archivo
 app.delete('/archivos/:id', authenticateToken, async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT a.evaluacion_id FROM archivos a
-     JOIN evaluaciones e ON e.id = a.evaluacion_id
-     JOIN ramos r ON r.id = e.ramo_id
-     WHERE a.id = $1 AND r.usuario_id = $2`,
-    [req.params.id, req.user.id]
-  )
-  if (rows.length === 0) return res.status(404).json({ error: 'Archivo no encontrado' })
-  await pool.query('DELETE FROM archivos WHERE id = $1', [req.params.id])
-  await pool.query(
-    'UPDATE evaluaciones SET texto_material = NULL, plan_estudio = NULL, guias_tareas = NULL WHERE id = $1',
-    [rows[0].evaluacion_id]
-  )
-  await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [rows[0].evaluacion_id])
-  res.json({ ok: true })
+  // Transacción: borra archivo + invalida material/plan/guías/podcasts en un
+  // solo paso atómico. Antes, si la segunda o tercera query fallaba quedaba
+  // material/plan huérfano apuntando a un archivo inexistente.
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      `SELECT a.evaluacion_id FROM archivos a
+       JOIN evaluaciones e ON e.id = a.evaluacion_id
+       JOIN ramos r ON r.id = e.ramo_id
+       WHERE a.id = $1 AND r.usuario_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (rows.length === 0) {
+      await client.query('ROLLBACK')
+      return res.status(404).json({ error: 'Archivo no encontrado' })
+    }
+    const evalId = rows[0].evaluacion_id
+    await client.query('DELETE FROM archivos WHERE id = $1', [req.params.id])
+    await client.query(
+      'UPDATE evaluaciones SET texto_material = NULL, plan_estudio = NULL, guias_tareas = NULL WHERE id = $1',
+      [evalId]
+    )
+    await client.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    console.error('Error eliminando archivo:', err)
+    res.status(500).json({ error: 'Error al eliminar el archivo' })
+  } finally {
+    client.release()
+  }
 })
 
 // ── Helpers IA ────────────────────────────────────────────────
