@@ -3487,33 +3487,51 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     let guion
     try { guion = JSON.parse(guionRes.choices[0].message.content) }
     catch(e) { return res.status(500).json({ error: 'Error generando guion' }) }
-    const voces = {
-      constanza: 'imFXYz8XIletRKLZZQaA',
-      benjamin: 'XgQWNZcJ8SRkxXwwhPTo'
+    // Migración de ElevenLabs a Azure Cognitive Services TTS.
+    // Voces neurales chilenas nativas (acento real es-CL en vez del neutro
+    // latino que daba ElevenLabs), costo menor y tier gratuito de 500k
+    // chars/mes. Mismo output MP3 → el resto del pipeline no cambia.
+    const VOCES_AZURE = {
+      constanza: 'es-CL-CatalinaNeural',
+      benjamin:  'es-CL-LorenzoNeural'
     }
+    const AZURE_TTS_RATE = '1.15' // 15% más dinámico
+
+    if (!process.env.AZURE_TTS_KEY || !process.env.AZURE_TTS_REGION) {
+      console.error('[podcast] Azure TTS no configurado: falta AZURE_TTS_KEY o AZURE_TTS_REGION en env')
+      if (podcastContadoEnLimite) {
+        await pool.query('UPDATE usuarios SET podcasts_usados = GREATEST(podcasts_usados - 1, 0) WHERE id = $1', [userId]).catch(()=>{})
+      }
+      return res.status(503).json({
+        error: 'servicio_no_configurado',
+        mensaje: 'El servicio de voz (TTS) no está configurado. Avisa al administrador.'
+      })
+    }
+
+    const xmlEscape = s => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;')
+    const azureEndpoint = `https://${process.env.AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`
+
     const audioBuffers = []
-    const elevenLabsKey = process.env.ELEVENLABS_API_KEY
     for (const seg of guion.segmentos) {
-      const voiceId = voces[seg.voz] || voces.constanza
-      const voiceSettings = seg.voz === 'constanza'
-        ? { stability: 0.55, similarity_boost: 0.75, style: 0.15, use_speaker_boost: true, speed: 1.05 }
-        : { stability: 0.45, similarity_boost: 0.80, style: 0.25, use_speaker_boost: true, speed: 1.05 }
-      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      const voiceName = VOCES_AZURE[seg.voz] || VOCES_AZURE.constanza
+      const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="es-CL"><voice name="${voiceName}"><prosody rate="${AZURE_TTS_RATE}">${xmlEscape(seg.texto)}</prosody></voice></speak>`
+      const response = await fetch(azureEndpoint, {
         method: 'POST',
         headers: {
-          'xi-api-key': elevenLabsKey,
-          'Content-Type': 'application/json',
-          'Accept': 'audio/mpeg'
+          'Ocp-Apim-Subscription-Key': process.env.AZURE_TTS_KEY,
+          'Content-Type': 'application/ssml+xml',
+          // 24 kHz mono 96 kbps MP3 — todos los segmentos tienen el mismo
+          // formato, así que Buffer.concat funciona sin transcoding.
+          'X-Microsoft-OutputFormat': 'audio-24khz-96kbitrate-mono-mp3',
+          'User-Agent': 'apprueba-podcast/1.0'
         },
-        body: JSON.stringify({
-          text: seg.texto,
-          model_id: 'eleven_turbo_v2_5',
-          voice_settings: voiceSettings
-        })
+        body: ssml
       })
       if (!response.ok) {
         const errText = await response.text()
-        throw new Error(`ElevenLabs error: ${response.status} - ${errText}`)
+        throw new Error(`Azure TTS error: ${response.status} - ${errText.slice(0, 300)}`)
       }
       audioBuffers.push(Buffer.from(await response.arrayBuffer()))
     }
