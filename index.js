@@ -2047,7 +2047,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
   )
 
   // Preview pendiente de confirmación por chat. TTL 10 min.
-  const pendingCasino = new Map() // chatId -> { titulo, descripcion, createdAt }
+  const pendingCasino = new Map() // chatId -> { menus: [{nombre, precio, platos}], createdAt }
   const descuentoDraft = new Map() // chatId -> { step, titulo, descripcion, createdAt }
   const PENDING_TTL_MS = 10 * 60 * 1000
   function getPendingCasino(chatId) {
@@ -2130,7 +2130,9 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           { type: 'text', text: CASINO_PROMPT },
           { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'high' } }
         ]}],
-        max_tokens: 600,
+        // 1200 tokens cubre 5-6 menús con 3-4 platos c/u sin riesgo de truncar
+        // el JSON a la mitad. Antes 600 cortaba con el menú Vegano incompleto.
+        max_tokens: 1200,
         response_format: { type: 'json_object' }
       })
 
@@ -2138,35 +2140,41 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       let parsed
       try { parsed = JSON.parse(raw) } catch (_) { parsed = { menus: [] } }
 
-      const menus = Array.isArray(parsed.menus) ? parsed.menus.filter(m => m && m.nombre) : []
+      // Normalizo cada menú y descarto los incompletos (sin nombre).
+      const menus = (Array.isArray(parsed.menus) ? parsed.menus : [])
+        .map(m => ({
+          nombre: String(m?.nombre || '').trim(),
+          precio: String(m?.precio || '').trim(),
+          platos: (Array.isArray(m?.platos) ? m.platos : [])
+            .map(p => String(p || '').trim())
+            .filter(Boolean)
+        }))
+        .filter(m => m.nombre)
+
       if (menus.length === 0) {
         await bot.sendMessage(chatId, '🤔 No detecté menús en esta imagen. ¿Es realmente el menú del casino?')
         return
       }
 
-      // Formato: "BAES $2.350: Porotos con rienda + Fruta natural · Ejecutivo $3.790: ..."
-      // Platos dentro de un menú se unen con " + "; menús entre sí con " · ".
-      const partes = menus.map(m => {
-        const nombre = String(m.nombre).trim()
-        const precio = m.precio ? ` ${String(m.precio).trim()}` : ''
-        const platos = Array.isArray(m.platos)
-          ? m.platos.map(p => String(p).trim()).filter(Boolean)
-          : []
-        const platosTxt = platos.length > 0 ? `: ${platos.join(' + ')}` : ''
-        return `${nombre}${precio}${platosTxt}`
-      }).filter(Boolean)
-      const descripcion = partes.join(' · ').slice(0, 500)
+      // Guardar preview en memoria — espera confirmación del usuario.
+      // Antes se guardaba un único titulo/descripcion concatenado (con slice
+      // 500). Ahora guardamos el array de menús y al confirmar se inserta
+      // una novedad por menú — así cada opción del casino se puede mostrar
+      // como card independiente en Apprueba.
+      pendingCasino.set(chatId, { menus, createdAt: Date.now() })
 
-      // Título compacto — el detalle va en descripción.
-      const titulo = menus.length === 1
-        ? `🍽️ Menú · ${String(menus[0].nombre).slice(0, 60)}`
-        : `🍽️ Casino hoy · ${menus.length} menús`
-
-      // Guardar preview en memoria — espera confirmación del usuario
-      pendingCasino.set(chatId, { titulo, descripcion, createdAt: Date.now() })
+      // Preview formateado por menú para que el admin revise antes de
+      // publicar. No aplica slice — el preview va sólo a Telegram.
+      const previewLines = menus.map(m => {
+        const precioTxt = m.precio ? ` · ${m.precio}` : ''
+        const platosTxt = m.platos.length > 0 ? `\n   ${m.platos.join(' + ')}` : ''
+        return `🍽️ *${m.nombre}*${precioTxt}${platosTxt}`
+      })
+      const cabecera = menus.length === 1 ? '📋 1 menú detectado:' : `📋 ${menus.length} menús detectados:`
+      const footer = menus.length === 1 ? '¿Publicar en Apprueba?' : `¿Publicar los ${menus.length} en Apprueba?`
 
       await bot.sendMessage(chatId,
-        `📋 *Preview del menú:*\n\n${descripcion}\n\n¿Publicar en Apprueba?`,
+        `${cabecera}\n\n${previewLines.join('\n\n')}\n\n${footer}`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -2279,28 +2287,46 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         return
       }
       if (data === 'casino_publish') {
+        const client = await pool.connect()
         try {
-          await pool.query(`
+          await client.query('BEGIN')
+          // Limpiar publicaciones previas del día (si ya se publicó el casino
+          // de hoy y se vuelve a mandar una foto más completa, reemplazamos).
+          await client.query(`
             DELETE FROM novedades
             WHERE universidad = 'ufro' AND origen = 'telegram' AND tipo = 'Casino'
               AND creada_en >= (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')) AT TIME ZONE 'America/Santiago'
           `)
-          await pool.query(`
-            INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
-            VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
-              (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
-          `, [pending.titulo, pending.descripcion])
+          // Una fila por menú — cada uno queda como novedad independiente.
+          // Antes todo iba en una sola descripcion con slice(500), lo que
+          // truncaba 2-3 menús en imágenes con pizarra completa.
+          for (const m of pending.menus) {
+            const titulo = m.precio
+              ? `🍽️ Menú ${m.nombre} · ${m.precio}`
+              : `🍽️ Menú ${m.nombre}`
+            const descripcion = (m.platos || []).filter(Boolean).join(' + ')
+            await client.query(`
+              INSERT INTO novedades (universidad, tipo, emoji, titulo, descripcion, color, origen, expira_en)
+              VALUES ('ufro', 'Casino', '🍽️', $1, $2, '#fbbf24', 'telegram',
+                (date_trunc('day', NOW() AT TIME ZONE 'America/Santiago') + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
+            `, [titulo.slice(0, 200), descripcion.slice(0, 2000)])
+          }
+          await client.query('COMMIT')
           novedadesCache.delete('ufro')
           pendingCasino.delete(chatId)
-          await bot.answerCallbackQuery(query.id, { text: '✅ Publicado' })
+          await bot.answerCallbackQuery(query.id, { text: `✅ ${pending.menus.length} menús publicados` })
+          const resumen = pending.menus.map(m => `• ${m.nombre}${m.precio ? ` · ${m.precio}` : ''}`).join('\n')
           await bot.editMessageText(
-            `✅ Menú publicado en Apprueba · caduca a medianoche.\n\n${pending.descripcion}`,
+            `✅ ${pending.menus.length} menú${pending.menus.length === 1 ? '' : 's'} publicado${pending.menus.length === 1 ? '' : 's'} en Apprueba · caduca${pending.menus.length === 1 ? '' : 'n'} a medianoche.\n\n${resumen}`,
             { chat_id: chatId, message_id: messageId }
           )
         } catch (err) {
+          await client.query('ROLLBACK').catch(() => {})
           console.error('❌ Bot Telegram (casino publish):', err.message)
           try { await bot.answerCallbackQuery(query.id, { text: 'Error al guardar' }) } catch(_) {}
           try { await bot.sendMessage(chatId, `⚠️ Error: ${err.message}`) } catch(_) {}
+        } finally {
+          client.release()
         }
       }
       return
