@@ -568,6 +568,20 @@ async function initDB() {
     ALTER TABLE novedades ADD COLUMN IF NOT EXISTS expira_en TIMESTAMP;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
+  // Backfill/normaliza numero_registro de fundadores por orden de created_at.
+  // Antes el código solo leía la columna — nunca la asignaba — así que
+  // usuarios tenían números inconsistentes heredados de migraciones manuales
+  // (ej. "#96" sin haber 50 usuarios). Idempotente: correr varias veces no
+  // cambia nada si ya están ordenados.
+  await pool.query(`
+    UPDATE usuarios u SET numero_registro = sub.n
+    FROM (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) AS n
+      FROM usuarios WHERE es_fundador = TRUE
+    ) sub
+    WHERE u.id = sub.id AND u.es_fundador = TRUE
+      AND (u.numero_registro IS DISTINCT FROM sub.n)
+  `)
   console.log('Base de datos lista ✅')
 }
 
@@ -607,12 +621,19 @@ passport.use(new GoogleStrategy({
     )
     const usuario = rows[0]
 
-    // Si es nuevo, marcar como fundador
+    // Si es nuevo, marcar como fundador y asignar numero_registro atómico.
+    // UPDATE con subquery evita race condition entre dos altas simultáneas.
     if (esNuevo) {
       const { rows: countRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
       if (parseInt(countRows[0].total) < 50) {
-        await pool.query('UPDATE usuarios SET es_fundador = TRUE WHERE id = $1', [usuario.id])
+        const { rows: upd } = await pool.query(
+          `UPDATE usuarios SET es_fundador = TRUE,
+             numero_registro = (SELECT COALESCE(MAX(numero_registro), 0) + 1 FROM usuarios WHERE es_fundador = TRUE)
+           WHERE id = $1 RETURNING numero_registro`,
+          [usuario.id]
+        )
         usuario.es_fundador = true
+        usuario.numero_registro = upd[0]?.numero_registro
       }
     }
 
@@ -642,8 +663,14 @@ app.post('/auth/register', async (req, res) => {
     const usuario = result.rows[0]
     const { rows: fundRows } = await pool.query('SELECT COUNT(*) as total FROM usuarios WHERE es_fundador = TRUE')
     if (parseInt(fundRows[0].total) < 50) {
-      await pool.query('UPDATE usuarios SET es_fundador = TRUE WHERE id = $1', [usuario.id])
+      const { rows: upd } = await pool.query(
+        `UPDATE usuarios SET es_fundador = TRUE,
+           numero_registro = (SELECT COALESCE(MAX(numero_registro), 0) + 1 FROM usuarios WHERE es_fundador = TRUE)
+         WHERE id = $1 RETURNING numero_registro`,
+        [usuario.id]
+      )
       usuario.es_fundador = true
+      usuario.numero_registro = upd[0]?.numero_registro
     }
     const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
     res.json({ token, usuario })
