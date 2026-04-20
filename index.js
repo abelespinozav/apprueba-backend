@@ -961,6 +961,7 @@ app.post('/evaluaciones/:id/plan-estudio', authenticateToken, upload.array('arch
     res.write(`data: ${JSON.stringify({ tipo, ...datos })}\n\n`)
     res.end()
   }
+  let planContadoEnLimite = false
   try {
     // Validar y parsear ID
     const evalId = parseInt(req.params.id, 10)
@@ -1078,13 +1079,19 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     if ((!ev.archivos || ev.archivos.length === 0) && youtubeUrlsArr.length === 0) {
       return terminar('error', { error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el plan.' })
     }
-    // BLOQUEO: límite de regeneraciones (solo si ya tiene plan)
+    // BLOQUEO: límite de regeneraciones (solo si ya tiene plan).
+    // Check-and-set atómico: previene race condition (dos requests pasando el
+    // check simultáneamente y gastando cupo doble). Si la IA falla después,
+    // se hace refund decrementando el contador.
     if (ev.plan_estudio) {
-      const planesRes = await pool.query('SELECT planes_usados FROM usuarios WHERE id = $1', [req.user.id])
-      const planesUsados = planesRes.rows[0]?.planes_usados || 0
       const limiteResP = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
       const limiteGlobalP = limiteResP.rows.length ? parseInt(limiteResP.rows[0].valor) : 100
-      if (planesUsados >= limiteGlobalP) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
+      const { rowCount } = await pool.query(
+        'UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1 AND planes_usados < $2',
+        [req.user.id, limiteGlobalP]
+      )
+      if (rowCount === 0) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
+      planContadoEnLimite = true
     }
     // Detectar archivos que fallaron
     const archivosConError = []
@@ -1133,9 +1140,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         enviar('progreso', { msg: '✅ Plan generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2, guias_tareas = NULL, plan_generando = FALSE WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
         await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
-        if (ev.plan_estudio) {
-          await pool.query('UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1', [usuarioId])
-        }
+        // El contador ya se incrementó atómicamente antes del setImmediate.
         // Guardar archivos en tabla archivos si no existen ya
         if (ev.archivos && ev.archivos.length > 0) {
           for (const archivo of ev.archivos) {
@@ -1169,6 +1174,10 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         } catch(fallbackErr) {
           console.error('Fallback error:', fallbackErr.message)
           await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId])
+          // Refund: la IA falló, devolvemos el cupo consumido atómicamente.
+          if (planContadoEnLimite) {
+            await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
+          }
           terminar('error', { error: 'error_interno', mensaje: 'No se pudo generar el plan. Intenta de nuevo.' })
         }
       }
@@ -1177,6 +1186,9 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
   } catch (err) {
     console.error('Error generando plan:', err)
     await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
+    if (planContadoEnLimite) {
+      await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+    }
     try { terminar('error', { error: 'error_interno', mensaje: 'Error al generar plan de estudio' }) } catch(_) {}
   }
 })
@@ -2941,15 +2953,24 @@ app.get('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
 })
 
 app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
+  let podcastContadoEnLimite = false
+  const userId = req.user.id
   try {
-    const userId = req.user.id
     const evId = req.params.id
     const tareaIdx = req.body.tareaIdx ?? null
-    const userRes = await pool.query('SELECT podcasts_usados FROM usuarios WHERE id = $1', [userId])
-    const usados = userRes.rows[0]?.podcasts_usados || 0
+    // Check-and-set atómico antes de invocar IA (previene race condition).
     const limiteRes = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limiteGlobal = limiteRes.rows.length ? parseInt(limiteRes.rows[0].valor) : 100
-    if (usados >= limiteGlobal) return res.status(403).json({ error: 'limite_alcanzado', usados, limite: limiteGlobal })
+    const { rows: incRows } = await pool.query(
+      'UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1 AND podcasts_usados < $2 RETURNING podcasts_usados',
+      [userId, limiteGlobal]
+    )
+    if (incRows.length === 0) {
+      const cur = await pool.query('SELECT podcasts_usados FROM usuarios WHERE id = $1', [userId])
+      return res.status(403).json({ error: 'limite_alcanzado', usados: cur.rows[0]?.podcasts_usados || limiteGlobal, limite: limiteGlobal })
+    }
+    podcastContadoEnLimite = true
+    const usados = incRows[0].podcasts_usados - 1 // valor previo, para compat con header X-Podcasts-Usados
     const evRes = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre, e.texto_material, e.plan_estudio FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2`,
       [evId, userId]
@@ -3028,7 +3049,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       audioBuffers.push(Buffer.from(await response.arrayBuffer()))
     }
     const audioFinal = Buffer.concat(audioBuffers)
-    await pool.query('UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1', [userId])
+    // El contador ya se incrementó atómicamente antes de llamar IA.
     const audioBase64 = audioFinal.toString('base64')
     const tituloFinal = guion.titulo || ev.nombre
     await pool.query(
@@ -3039,6 +3060,9 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     res.send(audioFinal)
   } catch(err) {
     console.error('Error generando podcast:', err)
+    if (podcastContadoEnLimite) {
+      await pool.query('UPDATE usuarios SET podcasts_usados = GREATEST(podcasts_usados - 1, 0) WHERE id = $1', [userId]).catch(()=>{})
+    }
     res.status(500).json({ error: 'Error generando podcast' })
   }
 })
@@ -3284,6 +3308,7 @@ app.get('/quiz/historial', authenticateToken, async (req, res) => {
 })
 
 app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
+  let quizContadoEnLimite = false
   try {
     const { forzar } = req.body
     const { rows: evRows } = await pool.query(
@@ -3297,13 +3322,21 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
-    // BLOQUEO: límite quizzes
-    const quizzesRes = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
-    const quizzesUsados = quizzesRes.rows[0]?.quizzes_usados || 0
+    // Check-and-set atómico antes de la IA.
     const limiteResQ = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limiteGlobalQ = limiteResQ.rows.length ? parseInt(limiteResQ.rows[0].valor) : 100
-    if (quizzesUsados >= limiteGlobalQ) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: quizzesUsados, limite: limiteGlobalQ })
+    const { rows: incQ } = await pool.query(
+      'UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1 AND quizzes_usados < $2 RETURNING quizzes_usados',
+      [req.user.id, limiteGlobalQ]
+    )
+    if (incQ.length === 0) {
+      const cur = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
+      return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: cur.rows[0]?.quizzes_usados || limiteGlobalQ, limite: limiteGlobalQ })
+    }
+    quizContadoEnLimite = true
     if (!ev.texto_material && (!ev.archivos || ev.archivos.length === 0)) {
+      // Refund inmediato — no se va a llamar IA.
+      await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [req.user.id])
       return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
     }
 
@@ -3404,17 +3437,22 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         })
         enviar('progreso', { msg: '✅ Quiz generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
-        await pool.query('UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1', [usuarioId])
+        // Contador ya incrementado atómicamente antes del setImmediate.
         enviar('quiz', { preguntas: quizData.preguntas })
         if (!res.destroyed) res.end()
       } catch (err) {
         console.error('Error generando quiz:', err)
+        // Refund: la IA falló, devolvemos el cupo.
+        await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
         enviar('error', { error: 'fallo_ia', mensaje: 'Error al generar quiz: ' + err.message })
         if (!res.destroyed) res.end()
       }
     })
   } catch (err) {
     console.error('Error generando quiz:', err)
+    if (quizContadoEnLimite) {
+      await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+    }
     res.status(500).json({ error: 'Error al generar quiz: ' + err.message })
   }
 })
@@ -3423,6 +3461,7 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
 const PDFDocument = require('pdfkit')
 
 app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res) => {
+  let ejContadoEnLimite = false
   try {
     const { tarea, tareaIndex, forzar } = req.body
     const evRes = await pool.query(
@@ -3448,12 +3487,18 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
       }
     }
 
-    // BLOQUEO: límite ejercicios
-    const ejerciciosRes = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
-    const ejerciciosUsados = ejerciciosRes.rows[0]?.ejercicios_usados || 0
+    // Check-and-set atómico antes de la IA.
     const limiteResE = await pool.query("SELECT valor FROM configuracion WHERE clave = 'limite_global'")
     const limiteGlobalE = limiteResE.rows.length ? parseInt(limiteResE.rows[0].valor) : 100
-    if (ejerciciosUsados >= limiteGlobalE) return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: ejerciciosUsados, limite: limiteGlobalE })
+    const { rows: incE } = await pool.query(
+      'UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1 AND ejercicios_usados < $2 RETURNING ejercicios_usados',
+      [req.user.id, limiteGlobalE]
+    )
+    if (incE.length === 0) {
+      const cur = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
+      return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: cur.rows[0]?.ejercicios_usados || limiteGlobalE, limite: limiteGlobalE })
+    }
+    ejContadoEnLimite = true
 
     const perfilEj = await getPerfilEstudiante(req.params.id)
     const perfilBloqueEj = formatPerfilBloque(perfilEj)
@@ -3491,7 +3536,7 @@ Responde SOLO con JSON válido:
           'UPDATE evaluaciones SET ejercicios_pdf = $1, ejercicios_pdf_generado_at = NOW(), ejercicios_pdf_tarea_index = $2 WHERE id = $3',
           [pdfBuf, tareaIndex, req.params.id]
         )
-        await pool.query('UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1', [req.user.id])
+        // Contador ya incrementado atómicamente antes de la IA.
       } catch(err) { console.error('Error cacheando PDF ejercicios:', err.message) }
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
@@ -3698,6 +3743,9 @@ Responde SOLO con JSON válido:
     doc.end()
   } catch(e) {
     console.error('Error ejercicios PDF:', e)
+    if (ejContadoEnLimite) {
+      await pool.query('UPDATE usuarios SET ejercicios_usados = GREATEST(ejercicios_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+    }
     if (!res.headersSent) res.status(500).json({ error: 'Error generando ejercicios' })
   }
 })
