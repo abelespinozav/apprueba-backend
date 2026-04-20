@@ -1106,25 +1106,32 @@ function formatPerfilBloque(perfil) {
 
 // Retry con backoff para llamadas gpt-4o chat completions. Bail inmediato
 // en 401/403 (no tiene sentido reintentar con credenciales rotas).
-// Resuelve el límite efectivo para un usuario y tipo. Si el usuario tiene
-// un override individual, usa ese; sino cae a configuracion.limite_global.
+// Resuelve el límite efectivo para un usuario y tipo. Cascade:
+//   1. usuarios.{tipo}_limite (override por usuario)
+//   2. configuracion.limite_{tipo} (global por tipo)
+//   3. configuracion.limite_global (global general)
+//   4. 100 (hardcoded fallback)
+// Null/ausente en cualquier paso hace caer al siguiente.
 async function resolverLimite(userId, tipo) {
-  const columnas = {
-    planes: 'planes_limite',
-    quizzes: 'quizzes_limite',
-    podcasts: 'podcasts_limite',
-    ejercicios: 'ejercicios_limite'
+  const mapa = {
+    planes:     { col: 'planes_limite',     claveGlobal: 'limite_planes' },
+    quizzes:    { col: 'quizzes_limite',    claveGlobal: 'limite_quizzes' },
+    podcasts:   { col: 'podcasts_limite',   claveGlobal: 'limite_podcasts' },
+    ejercicios: { col: 'ejercicios_limite', claveGlobal: 'limite_ejercicios' }
   }
-  const col = columnas[tipo]
-  if (!col) throw new Error(`Tipo de límite inválido: ${tipo}`)
+  const cfg = mapa[tipo]
+  if (!cfg) throw new Error(`Tipo de límite inválido: ${tipo}`)
   const { rows } = await pool.query(
-    `SELECT u.${col} AS individual,
+    `SELECT u.${cfg.col} AS individual,
+            (SELECT valor FROM configuracion WHERE clave = $2) AS por_tipo,
             (SELECT valor FROM configuracion WHERE clave = 'limite_global') AS global
      FROM usuarios u WHERE u.id = $1`,
-    [userId]
+    [userId, cfg.claveGlobal]
   )
   const individual = rows[0]?.individual
   if (individual !== null && individual !== undefined) return parseInt(individual)
+  const porTipo = rows[0]?.por_tipo
+  if (porTipo !== null && porTipo !== undefined) return parseInt(porTipo)
   const global = rows[0]?.global
   return global ? parseInt(global) : 100
 }
@@ -2853,6 +2860,76 @@ app.get('/admin/limite-global', authenticateToken, requireAdmin, async (req, res
     res.json({ limite })
   } catch(e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// Límites globales por tipo. La tabla configuracion es key-value; no son
+// columnas sino claves: limite_global + limite_{planes,quizzes,podcasts,ejercicios}.
+// null/vacío → la clave se borra y resolverLimite cae al limite_global.
+const CLAVES_LIMITES_TIPO = ['limite_planes', 'limite_quizzes', 'limite_podcasts', 'limite_ejercicios']
+
+app.get('/admin/limites-globales', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  try {
+    const claves = ['limite_global', ...CLAVES_LIMITES_TIPO]
+    const { rows } = await pool.query(
+      'SELECT clave, valor FROM configuracion WHERE clave = ANY($1)',
+      [claves]
+    )
+    const mapa = Object.fromEntries(rows.map(r => [r.clave, parseInt(r.valor)]))
+    res.json({
+      limite_global:     mapa.limite_global ?? 100,
+      limite_planes:     mapa.limite_planes     ?? null,
+      limite_quizzes:    mapa.limite_quizzes    ?? null,
+      limite_podcasts:   mapa.limite_podcasts   ?? null,
+      limite_ejercicios: mapa.limite_ejercicios ?? null
+    })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/admin/limites-globales', authenticateToken, requireAdmin, async (req, res) => {
+  if (req.user.email !== 'abelespinozav@gmail.com') return res.status(403).json({ error: 'No autorizado' })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // limite_global: siempre número >= 0 (upsert). No admite null — es el
+    // fallback final; si el admin manda null, ignoramos ese campo.
+    if ('limite_global' in req.body) {
+      const v = req.body.limite_global
+      const n = (v === '' || v === null || v === undefined) ? null : parseInt(v)
+      if (n !== null) {
+        if (isNaN(n) || n < 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'limite_global inválido' }) }
+        await client.query(
+          "INSERT INTO configuracion (clave, valor) VALUES ('limite_global', $1) ON CONFLICT (clave) DO UPDATE SET valor = $1",
+          [String(n)]
+        )
+      }
+    }
+    // Por tipo: null/'' → DELETE (usa el global); número >= 0 → upsert.
+    for (const clave of CLAVES_LIMITES_TIPO) {
+      if (!(clave in req.body)) continue
+      const v = req.body[clave]
+      if (v === '' || v === null || v === undefined) {
+        await client.query('DELETE FROM configuracion WHERE clave = $1', [clave])
+      } else {
+        const n = parseInt(v)
+        if (isNaN(n) || n < 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: `${clave} inválido` }) }
+        await client.query(
+          'INSERT INTO configuracion (clave, valor) VALUES ($1, $2) ON CONFLICT (clave) DO UPDATE SET valor = $2',
+          [clave, String(n)]
+        )
+      }
+    }
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch(err) {
+    await client.query('ROLLBACK').catch(() => {})
+    console.error('Error POST /admin/limites-globales:', err)
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
   }
 })
 
