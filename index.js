@@ -3475,14 +3475,17 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       model: 'gpt-4o',
       messages: [{
         role: 'system',
-        content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Constanza" (profesora entusiasta y experta) y "Benjamín" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 7 minutos. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "constanza"|"benjamin", "texto": "..." }] }. Mínimo 28 segmentos, máximo 35. Cada segmento debe tener 2-3 oraciones completas. Estructura: introducción motivadora (5 seg), desarrollo profundo por subtemas con ejemplos reales (45 seg), preguntas y respuestas entre Constanza y Benjamín (8 seg), conclusión y consejos para el examen (4 seg). Habla de forma MUY NATURAL como un podcast real. NUNCA uses el nombre del interlocutor para dirigirte a él/ella (nada de "así es Benjamín", "gracias Constanza", "qué buena pregunta"). Las transiciones deben ser naturales: "exacto", "claro", "mira", "lo que pasa es que...", "y ahí está la clave". Usa analogías, ejemplos cotidianos y humor ocasional.'
+        content: 'Eres un generador de podcasts educativos en español. Genera un guión conversacional entre dos personas: "Constanza" (profesora entusiasta y experta) y "Benjamín" (estudiante curioso que hace preguntas inteligentes). El podcast debe durar aproximadamente 10 minutos — ideal para escuchar en la micro camino a la universidad. Formato estricto JSON: { "titulo": "...", "segmentos": [{ "voz": "constanza"|"benjamin", "texto": "..." }] }. Mínimo 65 segmentos, máximo 80. Cada segmento debe tener 3-4 oraciones completas. Estructura aproximada (expresada en CANTIDAD DE SEGMENTOS, no minutos): introducción motivadora (5 segmentos), desarrollo profundo por subtemas con múltiples ejemplos reales y analogías (50 segmentos), preguntas y respuestas entre Constanza y Benjamín explorando dudas genuinas (15 segmentos), conclusión con repaso y consejos concretos para el examen (10 segmentos). Habla de forma MUY NATURAL como un podcast real — no un resumen apurado. Dedica tiempo a explicar bien cada concepto antes de pasar al siguiente. NUNCA uses el nombre del interlocutor para dirigirte a él/ella (nada de "así es Benjamín", "gracias Constanza", "qué buena pregunta"). Las transiciones deben ser naturales: "exacto", "claro", "mira", "lo que pasa es que...", "y ahí está la clave". Usa analogías, ejemplos cotidianos chilenos y humor ocasional.'
       }, {
         role: 'user',
         content: (perfilBloque ? perfilBloque + '\n\n' : '') + (material
-        ? 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad y ejemplos reales: ' + material.slice(0, 15000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2000) : '') + ' IMPORTANTE: El podcast debe tener entre 28 y 35 segmentos, cada uno con 2-3 oraciones. Sé conciso pero claro.'
-        : 'Crea un podcast educativo de 7 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo en máximo detalle: ' + plan.slice(0, 3000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con ejemplos, aplicaciones y casos reales.') + ' IMPORTANTE: Entre 28 y 35 segmentos, cada uno con 2-3 oraciones.')
+        ? 'Crea un podcast educativo de 10 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". Basa el podcast EXCLUSIVAMENTE en este material y cubre ABSOLUTAMENTE TODOS los temas con profundidad, varios ejemplos reales por concepto, y analogías concretas: ' + material.slice(0, 20000) + (plan ? ' Plan de estudio: ' + plan.slice(0, 2500) : '') + ' IMPORTANTE: El podcast debe tener entre 65 y 80 segmentos, cada uno con 3-4 oraciones. Desarrolla cada tema sin apuro — explícalo, ponele un ejemplo, verifica con una pregunta, y recién pasa al siguiente.'
+        : 'Crea un podcast educativo de 10 minutos para estudiar: "' + ev.nombre + '" del ramo "' + ev.ramo_nombre + '". ' + (plan ? 'Basa el contenido en este plan de estudio y desarróllalo con máximo detalle, múltiples ejemplos y analogías: ' + plan.slice(0, 4000) : 'Explica en profundidad todos los conceptos clave que un estudiante universitario necesita saber sobre este tema, con varios ejemplos, aplicaciones concretas, casos reales y analogías cotidianas chilenas.') + ' IMPORTANTE: Entre 65 y 80 segmentos, cada uno con 3-4 oraciones.')
       }],
-      response_format: { type: 'json_object' }
+      response_format: { type: 'json_object' },
+      // 80 segmentos × ~60 tokens c/u ≈ 4800 → el default 4096 trunca el JSON.
+      // 7000 da margen para títulos largos, textos más densos y cierres.
+      max_tokens: 7000
     })
     let guion
     try { guion = JSON.parse(guionRes.choices[0].message.content) }
@@ -3513,27 +3516,56 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       .replace(/"/g, '&quot;').replace(/'/g, '&apos;')
     const azureEndpoint = `https://${process.env.AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`
 
-    const audioBuffers = []
-    for (const seg of guion.segmentos) {
-      const voiceName = VOCES_AZURE[seg.voz] || VOCES_AZURE.constanza
-      const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="es-CL"><voice name="${voiceName}"><prosody rate="${AZURE_TTS_RATE}">${xmlEscape(seg.texto)}</prosody></voice></speak>`
-      const response = await fetch(azureEndpoint, {
-        method: 'POST',
-        headers: {
-          'Ocp-Apim-Subscription-Key': process.env.AZURE_TTS_KEY,
-          'Content-Type': 'application/ssml+xml',
-          // 24 kHz mono 96 kbps MP3 — todos los segmentos tienen el mismo
-          // formato, así que Buffer.concat funciona sin transcoding.
-          'X-Microsoft-OutputFormat': 'audio-24khz-96kbitrate-mono-mp3',
-          'User-Agent': 'apprueba-podcast/1.0'
-        },
-        body: ssml
-      })
-      if (!response.ok) {
-        const errText = await response.text()
-        throw new Error(`Azure TTS error: ${response.status} - ${errText.slice(0, 300)}`)
+    // Helper con retry exponencial para 429 (throttling). Azure TTS en free
+    // tier limita a ~20 req/s; 28-35 llamadas en serie a veces chocaban con
+    // el rate limit. 3 intentos con espera 1s/2s/4s maneja picos breves.
+    async function llamarAzureTTS(ssml, endpoint, key, intentos = 3) {
+      let lastErrText = ''
+      for (let i = 0; i < intentos; i++) {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Ocp-Apim-Subscription-Key': key,
+            'Content-Type': 'application/ssml+xml',
+            'X-Microsoft-OutputFormat': 'audio-24khz-96kbitrate-mono-mp3',
+            'User-Agent': 'apprueba-podcast/1.0'
+          },
+          body: ssml
+        })
+        if (response.status === 429) {
+          lastErrText = '429 Too Many Requests'
+          if (i < intentos - 1) {
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)))
+            continue
+          }
+          throw new Error(`Azure TTS error: 429 tras ${intentos} intentos`)
+        }
+        if (!response.ok) {
+          const errText = await response.text()
+          throw new Error(`Azure TTS error: ${response.status} - ${errText.slice(0, 300)}`)
+        }
+        return Buffer.from(await response.arrayBuffer())
       }
-      audioBuffers.push(Buffer.from(await response.arrayBuffer()))
+      // unreachable — el loop siempre retorna o lanza
+      throw new Error(`Azure TTS: ${lastErrText}`)
+    }
+
+    // Generar cada SSML, luego procesar en lotes de 4 concurrentes.
+    // Antes era serial (for ... await): 30 segs * ~250ms = ~7.5s y además
+    // cualquier pico de latencia se acumulaba. Ahora ~8s peak → ~2s con 4x.
+    // Orden preservado porque cada lote usa Promise.all con índices fijos.
+    const LOTE = 4
+    const ssmls = guion.segmentos.map(seg => {
+      const voiceName = VOCES_AZURE[seg.voz] || VOCES_AZURE.constanza
+      return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="es-CL"><voice name="${voiceName}"><prosody rate="${AZURE_TTS_RATE}">${xmlEscape(seg.texto)}</prosody></voice></speak>`
+    })
+    const audioBuffers = []
+    for (let i = 0; i < ssmls.length; i += LOTE) {
+      const lote = ssmls.slice(i, i + LOTE)
+      const resultados = await Promise.all(
+        lote.map(ssml => llamarAzureTTS(ssml, azureEndpoint, process.env.AZURE_TTS_KEY))
+      )
+      audioBuffers.push(...resultados)
     }
     const audioFinal = Buffer.concat(audioBuffers)
     // El contador ya se incrementó atómicamente antes de llamar IA.
