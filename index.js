@@ -30,19 +30,31 @@ const OpenAI = require('openai')
 // vencida (404 Not Found o 410 Gone) la BORRA de la tabla — así el conteo
 // de "usuarios con push activo" deja de mentir con el tiempo.
 // Devuelve { ok, expired } para que el caller agrupe métricas.
+//
+// Logs verbosos para diagnosticar por qué "enviadas" en el panel no llegan
+// al dispositivo. Si estas línea muestran 200/201 pero el usuario no ve
+// nada, el problema es del SW o de permisos del browser; si muestran
+// 403/404/410 es la suscripción; otros códigos sugieren config VAPID mala.
 async function enviarPushYLimpiar(row, payload) {
   const s = row.subscription
+  const endpointTail = s?.endpoint ? s.endpoint.slice(-30) : '(sin endpoint)'
   try {
-    await webpush.sendNotification(
+    const result = await webpush.sendNotification(
       { endpoint: s.endpoint, expirationTime: s.expirationTime, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } },
       payload
     )
+    console.log(`[push] OK sub#${row.id} …${endpointTail} status=${result?.statusCode}`)
     return { ok: true, expired: false }
   } catch (err) {
     const code = err?.statusCode
     const expired = code === 404 || code === 410
+    // Loguea TODOS los errores, no solo 404/410. 403 suele indicar VAPID
+    // equivocada (sospecha de rotación). 400 payload malformado. 429 rate
+    // limit del push service. 500+ downtime del push service.
+    console.warn(`[push] FAIL sub#${row.id} …${endpointTail} status=${code ?? 'sin-code'} expired=${expired} msg=${err?.message || err}`)
     if (expired && row.id != null) {
       await pool.query('DELETE FROM push_subscriptions WHERE id = $1', [row.id]).catch(() => {})
+      console.log(`[push] sub#${row.id} eliminada (vencida)`)
     }
     return { ok: false, expired }
   }
@@ -419,6 +431,15 @@ async function extraerContenido(archivo, enviar = () => {}) {
 // ══════════════════════════════════════════════════════════════
 const app = express()
 
+// VAPID keys son el par criptográfico que firma las pushes. Si se rotan,
+// TODAS las suscripciones creadas antes dejan de funcionar (algunas devuelven
+// 403, otras silencio). Logueo prefijo de la public key al arrancar para
+// poder comparar contra deploys previos si hay sospecha de rotación.
+if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+  console.error('❌ VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY no seteadas — push no funcionará')
+} else {
+  console.log(`🔑 VAPID public key activa: ${process.env.VAPID_PUBLIC_KEY.slice(0, 12)}…${process.env.VAPID_PUBLIC_KEY.slice(-6)}`)
+}
 webpush.setVapidDetails(
   'mailto:abelespinozav@gmail.com',
   process.env.VAPID_PUBLIC_KEY,
