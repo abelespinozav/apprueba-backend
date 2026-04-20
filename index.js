@@ -1137,14 +1137,20 @@ async function resolverLimite(userId, tipo) {
 }
 
 async function callOpenAIWithRetry(params, maxRetries = 2) {
+  // signal va como 2º argumento (options) en el SDK, no dentro del body.
+  // Antes se pasaba en params y la API devolvía 400 "Unrecognized request
+  // argument supplied: signal" — el único caller afectado era el endpoint
+  // de quiz, pero la fix queda en el helper para proteger futuros usos.
+  const { signal, ...bodyParams } = params
+  const reqOpts = signal ? { signal } : undefined
   let lastErr
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await openaiClient.chat.completions.create(params)
+      return await openaiClient.chat.completions.create(bodyParams, reqOpts)
     } catch (err) {
       lastErr = err
       // Bail inmediato si el cliente abortó (AbortController): reintento inútil.
-      if (err?.name === 'AbortError' || err?.message === 'aborted' || params.signal?.aborted) throw err
+      if (err?.name === 'AbortError' || err?.message === 'aborted' || signal?.aborted) throw err
       if (err.status === 401 || err.status === 403) throw err
       if (attempt === maxRetries) throw err
       console.warn(`OpenAI retry ${attempt}/${maxRetries}: ${err.message}`)
