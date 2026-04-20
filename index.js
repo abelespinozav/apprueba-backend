@@ -4019,15 +4019,27 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
           model: 'gpt-4o',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.7,
+          max_tokens: 6000,
           signal: abortCtl.signal
         })
         let text = result.choices[0].message.content
+        const finishReason = result.choices[0].finish_reason
+        console.log('[quiz] finish_reason:', finishReason, '| largo total:', text.length)
+        console.log('[quiz] respuesta cruda (primeros 500 chars):', text.slice(0, 500))
+        console.log('[quiz] respuesta cruda (últimos 200 chars):', text.slice(-200))
         text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
         const jsonMatch = text.match(/\{[\s\S]*\}/)
-        if (!jsonMatch) throw new Error('No se pudo parsear respuesta de IA')
+        if (!jsonMatch) {
+          console.error('[quiz] no se encontró bloque {...} en la respuesta')
+          throw new Error('No se pudo parsear respuesta de IA')
+        }
         let quizData
         try { quizData = JSON.parse(jsonMatch[0]); console.log('🔍 CORRECTAS:', quizData.preguntas.slice(0,5).map(p => p.correcta)) }
-        catch (parseErr) { throw new Error('La IA devolvió JSON inválido') }
+        catch (parseErr) {
+          console.error('[quiz] JSON.parse falló:', parseErr.message)
+          console.error('[quiz] bloque extraído (últimos 300 chars):', jsonMatch[0].slice(-300))
+          throw new Error('La IA devolvió JSON inválido')
+        }
         if (!quizData.preguntas || quizData.preguntas.length === 0) throw new Error('La IA no generó preguntas válidas')
         // Shufflear alternativas para que la correcta no siempre quede en A
         const letras = ['A','B','C','D']
