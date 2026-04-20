@@ -2881,6 +2881,22 @@ app.patch('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, 
     res.status(500).json({ error: 'Error al actualizar evaluación' })
   }
 })
+
+app.delete('/ramos/:ramoId/evaluaciones/:evalId', authenticateToken, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM evaluaciones
+       WHERE id = $1 AND ramo_id = $2
+       AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
+      [req.params.evalId, req.params.ramoId, req.user.id]
+    )
+    if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Error eliminando evaluación:', err)
+    res.status(500).json({ error: 'Error al eliminar evaluación' })
+  }
+})
 // Mon Apr  6 14:30:49 -04 2026
 // Mon Apr  6 14:31:43 -04 2026
 
