@@ -551,6 +551,7 @@ async function initDB() {
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_limite INTEGER;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS podcasts_limite INTEGER;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_limite INTEGER;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_nacimiento DATE;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_admin BOOLEAN DEFAULT false;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS podcasts_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
@@ -744,11 +745,42 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
   // sesión válida de 7 días nunca aparecen como "activos hoy" aunque sí
   // estén usando la app, y los DAU del panel admin quedan subestimados.
   await pool.query('UPDATE usuarios SET last_login = NOW() WHERE id = $1', [req.user.id]).catch(()=>{})
-  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
+  const { rows } = await pool.query('SELECT id, nombre, email, avatar, universidad, carrera, fecha_nacimiento, onboarding_completado, onboarding_v2, podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados, es_fundador, numero_registro, created_at FROM usuarios WHERE id = $1', [req.user.id])
   if (!rows[0]) return res.status(401).json({ error: 'Usuario no encontrado' })
   const u = rows[0]
   const { badge, badge_emoji } = buildBadge(u.email, u.es_fundador, u.numero_registro)
-  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2, es_fundador: u.es_fundador, numero_registro: u.numero_registro, badge, badge_emoji, created_at: u.created_at }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
+  res.json({ user: { id: u.id, name: u.nombre, email: u.email, picture: u.avatar, universidad: u.universidad, carrera: u.carrera, fecha_nacimiento: u.fecha_nacimiento, onboarding_completado: u.onboarding_completado, onboarding_v2: u.onboarding_v2, es_fundador: u.es_fundador, numero_registro: u.numero_registro, badge, badge_emoji, created_at: u.created_at }, podcasts_usados: u.podcasts_usados || 0, ejercicios_usados: u.ejercicios_usados || 0, quizzes_usados: u.quizzes_usados || 0, planes_usados: u.planes_usados || 0 })
+})
+
+// Actualiza campos de perfil editables por el propio usuario.
+app.patch('/auth/perfil', authenticateToken, async (req, res) => {
+  try {
+    const CAMPOS = ['nombre', 'carrera', 'fecha_nacimiento']
+    const sets = []
+    const vals = []
+    for (const c of CAMPOS) {
+      if (!(c in req.body)) continue
+      let v = req.body[c]
+      if (c === 'nombre') {
+        v = String(v || '').trim()
+        if (!v) return res.status(400).json({ error: 'El nombre no puede estar vacío' })
+      }
+      if (c === 'carrera') v = v === null ? null : String(v || '').trim() || null
+      if (c === 'fecha_nacimiento') {
+        if (v === '' || v === null) v = null
+        else if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return res.status(400).json({ error: 'Fecha inválida' })
+      }
+      sets.push(`${c} = $${vals.length + 1}`)
+      vals.push(v)
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'Sin campos para actualizar' })
+    vals.push(req.user.id)
+    await pool.query(`UPDATE usuarios SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals)
+    res.json({ ok: true })
+  } catch(err) {
+    console.error('Error PATCH perfil:', err)
+    res.status(500).json({ error: 'Error al actualizar perfil' })
+  }
 })
 
 app.post('/auth/logout', (req, res) => {
@@ -2605,7 +2637,7 @@ app.get('/admin/usuario/:id/detalle', authenticateToken, requireAdmin, async (re
     // usuario y el modal mostraba "—" en todos los campos.
     const { rows: usuarioRows } = await pool.query(`
       SELECT id, nombre, email, universidad, carrera, avatar,
-             created_at, last_login,
+             created_at, last_login, fecha_nacimiento,
              es_fundador, numero_registro,
              onboarding_v2, onboarding_completado,
              podcasts_usados, ejercicios_usados, quizzes_usados, planes_usados,
