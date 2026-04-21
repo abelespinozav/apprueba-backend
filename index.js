@@ -632,6 +632,23 @@ async function initDB() {
       motivo TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    -- Fase 5: logros desbloqueados + historial del quiz semanal.
+    CREATE TABLE IF NOT EXISTS logros_usuario (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      logro_id VARCHAR(50) NOT NULL,
+      desbloqueado_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(usuario_id, logro_id)
+    );
+    CREATE TABLE IF NOT EXISTS quiz_semanal_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      semana VARCHAR(10) NOT NULL,
+      puntaje INTEGER DEFAULT 0,
+      total INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(usuario_id, semana)
+    );
     CREATE TABLE IF NOT EXISTS horario (
       id SERIAL PRIMARY KEY,
       usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -973,6 +990,87 @@ app.get('/usuarios/gamificacion', authenticateToken, async (req, res) => {
   }
 })
 
+// ── LOGROS + QUIZ SEMANAL (Fase 5) ─────────────────────────────────────────
+// Devuelve el catálogo completo con un flag `desbloqueado` por cada logro.
+// El frontend agrupa por `categoria` y pinta en gris los no desbloqueados.
+app.get('/usuarios/logros', authenticateToken, async (req, res) => {
+  try {
+    const { rows: desbloqueados } = await pool.query(
+      `SELECT logro_id, desbloqueado_at FROM logros_usuario WHERE usuario_id = $1`,
+      [req.user.id]
+    )
+    const desbloqueadosMap = {}
+    desbloqueados.forEach(d => { desbloqueadosMap[d.logro_id] = d.desbloqueado_at })
+    const catalogo = LOGROS_CATALOGO.map(l => ({
+      ...l,
+      desbloqueado: !!desbloqueadosMap[l.id],
+      desbloqueado_at: desbloqueadosMap[l.id] || null
+    }))
+    res.json({ logros: catalogo, total: LOGROS_CATALOGO.length, desbloqueados: desbloqueados.length })
+  } catch (err) {
+    console.error('Error GET /usuarios/logros:', err)
+    res.status(500).json({ error: 'Error al obtener logros' })
+  }
+})
+
+// Código ISO-ish de semana actual (ej: "2026-W17"). Se usa como clave
+// única en quiz_semanal_historial para impedir dos entradas la misma
+// semana y detectar si el usuario ya jugó.
+function semanaActual() {
+  const now = new Date()
+  const year = now.getFullYear()
+  const start = new Date(year, 0, 1)
+  const week = Math.ceil(((now - start) / 86400000 + start.getDay() + 1) / 7)
+  return `${year}-W${String(week).padStart(2, '0')}`
+}
+
+// POST /quiz/semanal/guardar — guarda el mejor puntaje de la semana
+// actual (ON CONFLICT compara con GREATEST así que reintenos no pisan a
+// la baja). Otorga XP/créditos + logros quiz_semanal_1 y quiz_perfecto.
+app.post('/quiz/semanal/guardar', authenticateToken, async (req, res) => {
+  try {
+    const { puntaje, total = 20 } = req.body
+    if (!Number.isFinite(puntaje) || puntaje < 0 || puntaje > total) {
+      return res.status(400).json({ error: 'Puntaje inválido' })
+    }
+    const semana = semanaActual()
+    await pool.query(
+      `INSERT INTO quiz_semanal_historial (usuario_id, semana, puntaje, total)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (usuario_id, semana) DO UPDATE SET puntaje = GREATEST(quiz_semanal_historial.puntaje, $3)`,
+      [req.user.id, semana, puntaje, total]
+    )
+    otorgarXP(req.user.id, 60, 8, 'quiz_semanal').catch(() => {})
+    desbloquearLogro(req.user.id, 'quiz_semanal_1').catch(() => {})
+    if (puntaje === total) desbloquearLogro(req.user.id, 'quiz_perfecto').catch(() => {})
+    res.json({ ok: true, semana, puntaje, total, xp_ganado: 60, creditos_ganados: 8 })
+  } catch (err) {
+    console.error('Error POST /quiz/semanal/guardar:', err)
+    res.status(500).json({ error: 'Error al guardar quiz semanal' })
+  }
+})
+
+// GET /quiz/semanal/estado — el frontend lo usa para decidir si mostrar
+// el banner "disponible" o el banner "completado" en la tab Quiz.
+app.get('/quiz/semanal/estado', authenticateToken, async (req, res) => {
+  try {
+    const semana = semanaActual()
+    const { rows } = await pool.query(
+      `SELECT puntaje, total, created_at FROM quiz_semanal_historial
+        WHERE usuario_id = $1 AND semana = $2`,
+      [req.user.id, semana]
+    )
+    res.json({
+      semana,
+      jugado: rows.length > 0,
+      puntaje: rows[0]?.puntaje ?? null,
+      total: rows[0]?.total ?? 20
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Error al obtener estado quiz semanal' })
+  }
+})
+
 // Saldo de créditos y estado de suscripción del usuario autenticado.
 // El frontend consulta este endpoint para mostrar el saldo en header/modal
 // y decidir si habilitar los botones de generación.
@@ -1096,6 +1194,7 @@ app.post('/ramos', authenticateToken, async (req, res) => {
     [ramo.id]
   )
   res.json(ramoCompleto[0])
+  desbloquearLogro(req.user.id, 'primer_ramo').catch(() => {})
 })
 
 app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
@@ -1121,6 +1220,16 @@ app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
     // Solo recompensa cuando pasa de "sin nota" a "con nota" — editar no suma XP.
     if (notaPrevia == null && nota != null && nota !== '') {
       otorgarXP(req.user.id, 80, 5, 'registrar_nota').catch(e => console.error('otorgarXP registrar_nota:', e.message))
+      // Logros de notas.
+      if (parseFloat(nota) >= 7.0) desbloquearLogro(req.user.id, 'nota_7').catch(() => {})
+      pool.query(
+        `SELECT COUNT(*) FROM evaluaciones e
+           JOIN ramos r ON r.id = e.ramo_id
+          WHERE r.usuario_id = $1 AND e.nota IS NOT NULL`,
+        [req.user.id]
+      ).then(({ rows }) => {
+        if (parseInt(rows[0].count) >= 10) desbloquearLogro(req.user.id, 'diez_notas').catch(() => {})
+      }).catch(() => {})
     }
   } catch (err) {
     console.error('Error actualizando nota:', err)
@@ -1171,6 +1280,7 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
     )
     res.json(rows[0])
     otorgarXP(req.user.id, 50, 10, 'subir_material').catch(e => console.error('otorgarXP subir_material:', e.message))
+    desbloquearLogro(req.user.id, 'primer_material').catch(() => {})
   } catch (err) {
     console.error('Error subiendo archivo:', err)
     res.status(500).json({ error: 'Error al subir archivo' })
@@ -1357,6 +1467,70 @@ async function verificarYDescontarCreditos(usuarioId, costo) {
   return { ok: true, saldo: rows[0].creditos_total }
 }
 
+// ── LOGROS (Fase 5) ────────────────────────────────────────────────────────
+// Catálogo global de logros. El id es la clave en logros_usuario.logro_id.
+// Los logros de la categoría 'nivel' no otorgan XP (porque el usuario ya
+// ganó esa XP subiendo de nivel) — solo créditos bonus.
+// Definido a nivel de módulo (no dentro de initDB().then) porque tanto
+// otorgarXP como los endpoints /usuarios/logros lo leen.
+const LOGROS_CATALOGO = [
+  // Primeros pasos
+  { id: 'primer_ramo',      nombre: '¡Primer ramo!',         descripcion: 'Creaste tu primer ramo',                emoji: '📚', xp: 50,  creditos: 10, categoria: 'inicio' },
+  { id: 'primer_material',  nombre: 'Estudioso',              descripcion: 'Subiste tu primer material',             emoji: '📎', xp: 50,  creditos: 10, categoria: 'inicio' },
+  { id: 'primer_plan',      nombre: 'Planificador',           descripcion: 'Generaste tu primer plan de estudio',    emoji: '🧠', xp: 75,  creditos: 15, categoria: 'inicio' },
+  { id: 'primer_quiz',      nombre: 'Quiz master',            descripcion: 'Completaste tu primer quiz',             emoji: '⚡', xp: 75,  creditos: 15, categoria: 'inicio' },
+  { id: 'primer_horario',   nombre: 'Organizado',             descripcion: 'Importaste tu horario por primera vez',  emoji: '🗓', xp: 100, creditos: 20, categoria: 'inicio' },
+  // Racha
+  { id: 'racha_3',          nombre: 'En racha',               descripcion: '3 días consecutivos de actividad',       emoji: '🔥', xp: 100, creditos: 20, categoria: 'racha' },
+  { id: 'racha_7',          nombre: 'Imparable',              descripcion: '7 días consecutivos de actividad',       emoji: '🔥', xp: 200, creditos: 40, categoria: 'racha' },
+  { id: 'racha_30',         nombre: 'Leyenda',                descripcion: '30 días consecutivos de actividad',      emoji: '👑', xp: 500, creditos: 100, categoria: 'racha' },
+  // Notas
+  { id: 'nota_7',           nombre: 'Buena nota',             descripcion: 'Registraste una nota ≥ 7.0',             emoji: '🌟', xp: 80,  creditos: 15, categoria: 'notas' },
+  { id: 'diez_notas',       nombre: 'Historial completo',     descripcion: 'Registraste 10 notas distintas',         emoji: '📊', xp: 150, creditos: 25, categoria: 'notas' },
+  // Quiz semanal
+  { id: 'quiz_semanal_1',   nombre: 'Primera semana',         descripcion: 'Completaste el quiz semanal por 1ª vez', emoji: '📅', xp: 100, creditos: 20, categoria: 'quiz' },
+  { id: 'quiz_perfecto',    nombre: '¡Perfecto!',             descripcion: 'Obtuviste 20/20 en un quiz',             emoji: '💯', xp: 300, creditos: 50, categoria: 'quiz' },
+  // Nivel
+  { id: 'nivel_3',          nombre: 'Aplicado',               descripcion: 'Alcanzaste el nivel 3',                  emoji: '📗', xp: 0,   creditos: 30, categoria: 'nivel' },
+  { id: 'nivel_5',          nombre: 'Brillante',              descripcion: 'Alcanzaste el nivel 5',                  emoji: '⭐', xp: 0,   creditos: 60, categoria: 'nivel' },
+  { id: 'nivel_8',          nombre: 'Leyenda del estudio',    descripcion: 'Alcanzaste el nivel 8',                  emoji: '👑', xp: 0,   creditos: 150, categoria: 'nivel' },
+]
+
+// Otorga un logro idempotentemente. Si el usuario ya lo tenía, retorna null
+// y no hace nada (el UNIQUE constraint + ON CONFLICT DO NOTHING garantiza
+// que no se otorguen las recompensas dos veces). Uso: siempre con .catch(()=>{})
+// después de operaciones exitosas — si el logro falla no debe reventar el flow.
+async function desbloquearLogro(usuarioId, logroId) {
+  const logro = LOGROS_CATALOGO.find(l => l.id === logroId)
+  if (!logro) return null
+  const { rowCount } = await pool.query(
+    `INSERT INTO logros_usuario (usuario_id, logro_id)
+     VALUES ($1, $2)
+     ON CONFLICT (usuario_id, logro_id) DO NOTHING`,
+    [usuarioId, logroId]
+  )
+  if (rowCount === 0) return null // ya lo tenía
+  if (logro.xp > 0) {
+    await pool.query(
+      `UPDATE usuarios SET xp_total = COALESCE(xp_total, 0) + $2 WHERE id = $1`,
+      [usuarioId, logro.xp]
+    )
+    await pool.query(
+      'INSERT INTO xp_historial (usuario_id, xp, creditos, motivo) VALUES ($1, $2, 0, $3)',
+      [usuarioId, logro.xp, `logro_${logroId}`]
+    )
+  }
+  if (logro.creditos > 0) {
+    await otorgarCreditos(usuarioId, logro.creditos, 'gamificacion')
+    await pool.query(
+      'INSERT INTO creditos_transacciones (usuario_id, cantidad, tipo, motivo) VALUES ($1, $2, $3, $4)',
+      [usuarioId, logro.creditos, 'gamificacion', `logro_${logroId}`]
+    )
+  }
+  console.log(`[logro] usuario ${usuarioId} desbloqueó: ${logroId}`)
+  return logro
+}
+
 // Suma XP al usuario, opcionalmente otorga créditos de gamificación y
 // deja rastro en xp_historial (+creditos_transacciones si hubo créditos).
 // Úsalo DESPUÉS de que la operación principal haya sido exitosa: si algo
@@ -1411,6 +1585,11 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
   }
   const nuevaMejorRacha = Math.max(nuevaRacha, u.mejor_racha)
 
+  // Logros de racha (Fase 5) — idempotentes, se auto-ignoran si ya existen.
+  if (nuevaRacha >= 3)  desbloquearLogro(usuarioId, 'racha_3').catch(() => {})
+  if (nuevaRacha >= 7)  desbloquearLogro(usuarioId, 'racha_7').catch(() => {})
+  if (nuevaRacha >= 30) desbloquearLogro(usuarioId, 'racha_30').catch(() => {})
+
   // ── UPDATE principal: XP + racha ──────────────────────────────────────────
   const { rows } = await pool.query(
     `UPDATE usuarios
@@ -1428,6 +1607,11 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
   // Niveles: cada 500 XP sube un nivel (nivel 1 = 0–499 XP, nivel 2 = 500–999 XP, …)
   const nivelNuevo = Math.max(1, Math.floor(xp_total_nuevo / 500) + 1)
   await pool.query('UPDATE usuarios SET nivel = $1 WHERE id = $2', [nivelNuevo, usuarioId])
+
+  // Logros de nivel (Fase 5).
+  if (nivelNuevo >= 3) desbloquearLogro(usuarioId, 'nivel_3').catch(() => {})
+  if (nivelNuevo >= 5) desbloquearLogro(usuarioId, 'nivel_5').catch(() => {})
+  if (nivelNuevo >= 8) desbloquearLogro(usuarioId, 'nivel_8').catch(() => {})
 
   // ── Créditos base por acción ───────────────────────────────────────────────
   let creditos_otorgados = 0
@@ -1751,6 +1935,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         }
         clearTimeout(abortTimer)
         terminar('plan', { plan })
+        desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
         // Notificar al usuario
         await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
       } catch(geminiErr) {
@@ -1774,6 +1959,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
           await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
           clearTimeout(abortTimer)
           terminar('plan', { plan: plan2 })
+          desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
           await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
         } catch(fallbackErr) {
           console.error('Fallback error:', fallbackErr.message)
@@ -3239,6 +3425,7 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
       if (bloques.length === 0) return res.status(400).json({ error: 'No se pudieron extraer bloques del archivo xlsx' })
       res.json({ bloques })
       otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
+      desbloquearLogro(req.user.id, 'primer_horario').catch(() => {})
       return
     }
 
@@ -3291,6 +3478,7 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
     console.log('Bloques extraidos:', bloques.length, bloques)
     res.json({ bloques })
     otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
+    desbloquearLogro(req.user.id, 'primer_horario').catch(() => {})
   } catch(err) {
     console.error('Error XLS:', err)
     res.status(500).json({ error: err.message })
@@ -3346,6 +3534,7 @@ app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (
     const bloques = JSON.parse(jsonMatch[0])
     res.json({ bloques })
     otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
+    desbloquearLogro(req.user.id, 'primer_horario').catch(() => {})
   } catch(err) { console.error('❌ Error horario/extraer:', err); res.status(500).json({ error: err.message }) }
 })
 
@@ -4575,6 +4764,10 @@ app.post('/quiz/historial', authenticateToken, async (req, res) => {
     )
     res.json({ ok: true })
     otorgarXP(req.user.id, 120, 10, 'responder_quiz').catch(e => console.error('otorgarXP responder_quiz:', e.message))
+    desbloquearLogro(req.user.id, 'primer_quiz').catch(() => {})
+    if (parseInt(puntaje) === parseInt(total) && parseInt(total) === 20) {
+      desbloquearLogro(req.user.id, 'quiz_perfecto').catch(() => {})
+    }
   } catch(e) { console.error('❌ Error POST /quiz/historial:', e.message); res.status(500).json({ error: e.message }) }
 })
 
