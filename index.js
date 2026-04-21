@@ -1365,12 +1365,71 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
   if (!Number.isFinite(xp) || xp <= 0) throw new Error('XP inválido')
   if (!Number.isFinite(creditos) || creditos < 0) throw new Error('Créditos inválidos')
   if (!motivo) throw new Error('Motivo requerido')
+
+  // ── Racha diaria ──────────────────────────────────────────────────────────
+  // Obtenemos ultima_actividad y racha_dias actuales para calcular la nueva racha.
+  // Lógica:
+  //   • Si ultima_actividad es HOY  → ya contamos, no incrementamos racha
+  //   • Si ultima_actividad es AYER → +1 racha (racha consecutiva)
+  //   • Cualquier otro caso          → reset a 1 (racha cortada o primera actividad)
+  // Timezone: America/Santiago (UTC-3 o UTC-4 según DST). Usamos AT TIME ZONE
+  // en la query para comparar fechas en hora local chilena.
+  const { rows: rachaRows } = await pool.query(
+    `SELECT COALESCE(racha_dias, 0) AS racha_dias,
+            COALESCE(mejor_racha, 0) AS mejor_racha,
+            ultima_actividad::date AS ultima_actividad
+       FROM usuarios WHERE id = $1`,
+    [usuarioId]
+  )
+  const u = rachaRows[0] ?? {}
+  const hoyChile = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Santiago' }))
+  hoyChile.setHours(0, 0, 0, 0)
+  const hoyStr = hoyChile.toISOString().slice(0, 10)
+
+  let nuevaRacha = 1
+  let xpBonusRacha = 0
+  let bonusMotivo = null
+  if (u.ultima_actividad) {
+    const ultimaStr = String(u.ultima_actividad).slice(0, 10)
+    if (ultimaStr === hoyStr) {
+      // Ya tuvo actividad hoy — no cambiar racha
+      nuevaRacha = u.racha_dias
+    } else {
+      const ayerChile = new Date(hoyChile)
+      ayerChile.setDate(ayerChile.getDate() - 1)
+      const ayerStr = ayerChile.toISOString().slice(0, 10)
+      if (ultimaStr === ayerStr) {
+        nuevaRacha = u.racha_dias + 1
+        // Bonus XP en hitos de racha: 7, 14, 30 días
+        if (nuevaRacha === 7) { xpBonusRacha = 100; bonusMotivo = 'racha_7_dias' }
+        else if (nuevaRacha === 14) { xpBonusRacha = 250; bonusMotivo = 'racha_14_dias' }
+        else if (nuevaRacha === 30) { xpBonusRacha = 500; bonusMotivo = 'racha_30_dias' }
+      } else {
+        nuevaRacha = 1 // racha cortada
+      }
+    }
+  }
+  const nuevaMejorRacha = Math.max(nuevaRacha, u.mejor_racha)
+
+  // ── UPDATE principal: XP + racha ──────────────────────────────────────────
   const { rows } = await pool.query(
-    `UPDATE usuarios SET xp_total = COALESCE(xp_total, 0) + $2
-      WHERE id = $1 RETURNING xp_total`,
-    [usuarioId, xp]
+    `UPDATE usuarios
+        SET xp_total          = COALESCE(xp_total, 0) + $2,
+            racha_dias        = $3,
+            mejor_racha       = $4,
+            ultima_actividad  = $5
+      WHERE id = $1
+  RETURNING xp_total`,
+    [usuarioId, xp, nuevaRacha, nuevaMejorRacha, hoyStr]
   )
   const xp_total_nuevo = rows[0]?.xp_total ?? 0
+
+  // ── Calcular nivel basado en XP total ─────────────────────────────────────
+  // Niveles: cada 500 XP sube un nivel (nivel 1 = 0–499 XP, nivel 2 = 500–999 XP, …)
+  const nivelNuevo = Math.max(1, Math.floor(xp_total_nuevo / 500) + 1)
+  await pool.query('UPDATE usuarios SET nivel = $1 WHERE id = $2', [nivelNuevo, usuarioId])
+
+  // ── Créditos base por acción ───────────────────────────────────────────────
   let creditos_otorgados = 0
   if (creditos > 0) {
     await otorgarCreditos(usuarioId, creditos, 'gamificacion')
@@ -1384,7 +1443,27 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
     'INSERT INTO xp_historial (usuario_id, xp, creditos, motivo) VALUES ($1, $2, $3, $4)',
     [usuarioId, xp, creditos_otorgados, motivo]
   )
-  return { xp_total_nuevo, creditos_otorgados }
+
+  // ── Bonus de hito de racha ────────────────────────────────────────────────
+  if (xpBonusRacha > 0 && bonusMotivo) {
+    await pool.query(
+      `UPDATE usuarios SET xp_total = COALESCE(xp_total, 0) + $2 WHERE id = $1`,
+      [usuarioId, xpBonusRacha]
+    )
+    // Bonus de créditos por hito: 20 cr por 7 días, 50 cr por 14 días, 100 cr por 30 días
+    const creditosBonus = bonusMotivo === 'racha_7_dias' ? 20 : bonusMotivo === 'racha_14_dias' ? 50 : 100
+    await otorgarCreditos(usuarioId, creditosBonus, 'gamificacion')
+    await pool.query(
+      'INSERT INTO xp_historial (usuario_id, xp, creditos, motivo) VALUES ($1, $2, $3, $4)',
+      [usuarioId, xpBonusRacha, creditosBonus, bonusMotivo]
+    )
+    await pool.query(
+      'INSERT INTO creditos_transacciones (usuario_id, cantidad, tipo, motivo) VALUES ($1, $2, $3, $4)',
+      [usuarioId, creditosBonus, 'gamificacion', bonusMotivo]
+    )
+  }
+
+  return { xp_total_nuevo, creditos_otorgados, racha_dias: nuevaRacha, nivel: nivelNuevo }
 }
 
 // ── KHIPU ─────────────────────────────────────────────────────────────────
