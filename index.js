@@ -24,7 +24,6 @@ const os = require('os')
 ffmpeg.setFfmpegPath(ffmpegPath)
 const bcrypt = require('bcrypt')
 const OpenAI = require('openai')
-const crypto = require('crypto')
 const axios = require('axios')
 
 // Helper: enviar notificación push a usuario específico
@@ -1389,52 +1388,39 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
 }
 
 // ── KHIPU ─────────────────────────────────────────────────────────────────
-// Pasarela de pago chilena. Receiver/secret en env; hay un fallback a las
-// credenciales de la cuenta desarrollador para que el boot no falle en dev.
-const KHIPU_RECEIVER_ID = process.env.KHIPU_RECEIVER_ID || '516423'
-const KHIPU_SECRET = process.env.KHIPU_SECRET || '0a7f4b6b384251350898cc3a513d92642b9acb24'
+// Pasarela de pago chilena. API v3 usa x-api-key en el header (no HMAC-SHA256,
+// eso era la v2). La API key se genera desde el panel de Khipu en:
+// Cuentas de cobro → tu cuenta → Opciones → API → Generar API Key.
+// El receiver_id y el secret de la v2 ya no son necesarios para autenticar.
+const KHIPU_API_KEY = process.env.KHIPU_API_KEY || ''
 const KHIPU_API = 'https://payment-api.khipu.com/v3'
 
-// Khipu v3: la firma es HMAC-SHA256 sobre "METHOD&URL_encoded&PARAMS_encoded".
-// Los parámetros van ordenados alfabéticamente por key (clave del algoritmo
-// oficial de Khipu). Header Authorization = "receiver_id:hex_signature".
-function khipuSign(method, path, params = {}) {
-  const toSign = method.toUpperCase() + '&' +
-    encodeURIComponent(KHIPU_API + path) + '&' +
-    encodeURIComponent(Object.keys(params).sort().map(k =>
-      encodeURIComponent(k) + '=' + encodeURIComponent(params[k])
-    ).join('&'))
-  return crypto.createHmac('sha256', KHIPU_SECRET).update(toSign).digest('hex')
-}
-
 async function khipuCrearPago({ subject, amount, currency = 'CLP', returnUrl, cancelUrl, transactionId, customerId }) {
-  const params = {
-    receiver_id: KHIPU_RECEIVER_ID,
+  const backendUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : (process.env.CLIENT_URL ? process.env.CLIENT_URL.replace(/\/$/, '') : 'https://apprueba-production.up.railway.app')
+  const { data } = await axios.post(`${KHIPU_API}/payments`, {
     subject,
-    amount: String(amount),
+    amount,
     currency,
     return_url: returnUrl,
     cancel_url: cancelUrl,
     transaction_id: transactionId,
     custom: customerId,
-    notify_url: `${process.env.CLIENT_URL ? process.env.CLIENT_URL.replace(/\/$/, '') : 'https://apprueba-production.up.railway.app'}/api/suscripcion/webhook`,
+    notify_url: `${backendUrl}/suscripcion/webhook`,
     notify_api_version: '1.3'
-  }
-  const sig = khipuSign('POST', '/payments', params)
-  const body = Object.keys(params).map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&')
-  const { data } = await axios.post(`${KHIPU_API}/payments`, body, {
+  }, {
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: `${KHIPU_RECEIVER_ID}:${sig}`
+      'Content-Type': 'application/json',
+      'x-api-key': KHIPU_API_KEY
     }
   })
   return data
 }
 
 async function khipuVerificarPago(paymentId) {
-  const sig = khipuSign('GET', `/payments/${paymentId}`, {})
   const { data } = await axios.get(`${KHIPU_API}/payments/${paymentId}`, {
-    headers: { Authorization: `${KHIPU_RECEIVER_ID}:${sig}` }
+    headers: { 'x-api-key': KHIPU_API_KEY }
   })
   return data
 }
