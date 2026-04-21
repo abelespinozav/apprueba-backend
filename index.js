@@ -2220,6 +2220,19 @@ app.post('/suscripcion/webhook', express.urlencoded({ extended: true }), async (
         `UPDATE pagos_khipu SET estado = $1, khipu_response = $2, updated_at = NOW() WHERE payment_id = $3`,
         [pagoKhipu.status, JSON.stringify(pagoKhipu), payment_id]
       )
+      const { rows: pagoRows } = await pool.query(
+        `SELECT usuario_id FROM pagos_khipu WHERE payment_id = $1`,
+        [payment_id]
+      )
+      const usuario_id = pagoRows[0]?.usuario_id
+      if (usuario_id) {
+        await notificarUsuario(
+          usuario_id,
+          '❌ Tu pago no se completó',
+          'Hubo un problema al procesar tu pago. Intenta nuevamente desde la app.',
+          '/planes'
+        ).catch(() => {})
+      }
       return res.json({ ok: true, estado: pagoKhipu.status })
     }
 
@@ -2379,6 +2392,12 @@ cron.schedule('0 1 * * *', async () => {
         await pool.query(
           `INSERT INTO suscripciones_historial (usuario_id, plan, accion, motivo) VALUES ($1, $2, 'expirar', 'vencimiento_automatico')`,
           [u.id, u.plan]
+        ).catch(() => {})
+        await notificarUsuario(
+          u.id,
+          '📅 Tu suscripción ha vencido',
+          'Tu plan ha vuelto al nivel Aprobado. Renueva desde la app para seguir con tus beneficios.',
+          '/planes'
         ).catch(() => {})
       }
     }
