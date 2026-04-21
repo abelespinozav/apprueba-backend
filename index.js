@@ -1969,6 +1969,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
           `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'plan', $2, 15)`,
           [usuarioId, ev.ramo_nombre || 'Plan']
         ).catch(() => {})
+        otorgarXP(usuarioId, 60, 0, 'generar_plan').catch(() => {})
         desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
         // Notificar al usuario
         await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
@@ -1997,6 +1998,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
             `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'plan', $2, 15)`,
             [usuarioId, ev.ramo_nombre || 'Plan']
           ).catch(() => {})
+          otorgarXP(usuarioId, 60, 0, 'generar_plan').catch(() => {})
           desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
           await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
         } catch(fallbackErr) {
@@ -4427,6 +4429,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     }
     // BLOQUEO: no generar podcast sin material
     if (!material) {
+      await otorgarCreditos(userId, 30, 'comprado').catch(() => {})
       return res.status(400).json({ error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el podcast.' })
     }
     const plan = ev.plan_estudio ? JSON.stringify(ev.plan_estudio) : ''
@@ -4548,6 +4551,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'podcast', $2, 30)`,
       [userId, ev.ramo_nombre || 'Podcast']
     ).catch(() => {})
+    otorgarXP(userId, 70, 0, 'generar_podcast').catch(() => {})
     res.set({ 'Content-Type': 'audio/mpeg', 'X-Podcasts-Usados': usados + 1, 'X-Podcast-Titulo': encodeURIComponent(tituloFinal) })
     res.send(audioFinal)
     // Push al final. El user pidió podcast y es útil si cerró la tab mientras
@@ -4683,6 +4687,7 @@ Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con ins
       `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'guia', $2, 8)`,
       [req.user.id, ev.ramo_nombre || 'Guía']
     ).catch(() => {})
+    otorgarXP(req.user.id, 40, 0, 'generar_guia').catch(() => {})
 
     res.json(guia)
   } catch (err) {
@@ -4975,6 +4980,7 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
           `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'quiz', $2, 10)`,
           [usuarioId, ev.ramo_nombre || 'Quiz']
         ).catch(() => {})
+        otorgarXP(usuarioId, 50, 0, 'generar_quiz').catch(() => {})
         // Contador ya incrementado atómicamente antes del setImmediate.
         clearTimeout(abortTimer)
         enviar('quiz', { preguntas: quizData.preguntas })
@@ -5092,6 +5098,7 @@ Responde SOLO con JSON válido:
         `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'ejercicios', $2, 12)`,
         [req.user.id, ev.ramo_nombre || 'Ejercicios']
       ).catch(() => {})
+      otorgarXP(req.user.id, 50, 0, 'generar_ejercicios').catch(() => {})
       await notificarUsuario(
         req.user.id,
         '📄 ¡Tus ejercicios están listos!',
