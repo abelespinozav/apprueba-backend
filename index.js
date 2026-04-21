@@ -24,6 +24,8 @@ const os = require('os')
 ffmpeg.setFfmpegPath(ffmpegPath)
 const bcrypt = require('bcrypt')
 const OpenAI = require('openai')
+const crypto = require('crypto')
+const axios = require('axios')
 
 // Helper: enviar notificación push a usuario específico
 // Shape ÚNICA de payload para todas las pushes (crons internos + admin +
@@ -608,6 +610,27 @@ async function initDB() {
       cantidad INTEGER NOT NULL,
       tipo TEXT NOT NULL,
       motivo TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    -- Fase 2: pagos Khipu y bitácora de suscripciones.
+    CREATE TABLE IF NOT EXISTS pagos_khipu (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      payment_id VARCHAR(100) UNIQUE,
+      plan VARCHAR(50) NOT NULL,
+      monto INTEGER NOT NULL,
+      estado VARCHAR(30) DEFAULT 'pendiente',
+      khipu_url TEXT,
+      khipu_response JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS suscripciones_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      plan VARCHAR(50),
+      accion VARCHAR(30),
+      motivo TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS horario (
@@ -1365,6 +1388,57 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
   return { xp_total_nuevo, creditos_otorgados }
 }
 
+// ── KHIPU ─────────────────────────────────────────────────────────────────
+// Pasarela de pago chilena. Receiver/secret en env; hay un fallback a las
+// credenciales de la cuenta desarrollador para que el boot no falle en dev.
+const KHIPU_RECEIVER_ID = process.env.KHIPU_RECEIVER_ID || '516423'
+const KHIPU_SECRET = process.env.KHIPU_SECRET || '0a7f4b6b384251350898cc3a513d92642b9acb24'
+const KHIPU_API = 'https://payment-api.khipu.com/v3'
+
+// Khipu v3: la firma es HMAC-SHA256 sobre "METHOD&URL_encoded&PARAMS_encoded".
+// Los parámetros van ordenados alfabéticamente por key (clave del algoritmo
+// oficial de Khipu). Header Authorization = "receiver_id:hex_signature".
+function khipuSign(method, path, params = {}) {
+  const toSign = method.toUpperCase() + '&' +
+    encodeURIComponent(KHIPU_API + path) + '&' +
+    encodeURIComponent(Object.keys(params).sort().map(k =>
+      encodeURIComponent(k) + '=' + encodeURIComponent(params[k])
+    ).join('&'))
+  return crypto.createHmac('sha256', KHIPU_SECRET).update(toSign).digest('hex')
+}
+
+async function khipuCrearPago({ subject, amount, currency = 'CLP', returnUrl, cancelUrl, transactionId, customerId }) {
+  const params = {
+    receiver_id: KHIPU_RECEIVER_ID,
+    subject,
+    amount: String(amount),
+    currency,
+    return_url: returnUrl,
+    cancel_url: cancelUrl,
+    transaction_id: transactionId,
+    custom: customerId,
+    notify_url: `${process.env.CLIENT_URL ? process.env.CLIENT_URL.replace(/\/$/, '') : 'https://apprueba-production.up.railway.app'}/api/suscripcion/webhook`,
+    notify_api_version: '1.3'
+  }
+  const sig = khipuSign('POST', '/payments', params)
+  const body = Object.keys(params).map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&')
+  const { data } = await axios.post(`${KHIPU_API}/payments`, body, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `${KHIPU_RECEIVER_ID}:${sig}`
+    }
+  })
+  return data
+}
+
+async function khipuVerificarPago(paymentId) {
+  const sig = khipuSign('GET', `/payments/${paymentId}`, {})
+  const { data } = await axios.get(`${KHIPU_API}/payments/${paymentId}`, {
+    headers: { Authorization: `${KHIPU_RECEIVER_ID}:${sig}` }
+  })
+  return data
+}
+
 async function callOpenAIWithRetry(params, maxRetries = 2) {
   // signal va como 2º argumento (options) en el SDK, no dentro del body.
   // Antes se pasaba en params y la API devolvía 400 "Unrecognized request
@@ -1564,12 +1638,12 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     const usuarioId = req.user.id
     const nombreEval = ev.nombre || 'tu evaluación'
 
-    // Abort cuando el cliente cierra la conexión o cuando pasan 15 min.
-    // Antes: setImmediate corría sin corte, consumiendo OpenAI + CPU si el
-    // usuario cerraba el tab o la generación se colgaba.
+    // Abort solo por timeout (15 min). NO abortar cuando el cliente cierra
+    // la conexión SSE: en móvil el socket se cierra por pantalla en reposo,
+    // cambio de app o red inestable — no porque el usuario canceló.
+    // La generación corre en background; el polling del frontend la recoge.
     const abortCtl = new AbortController()
     const abortTimer = setTimeout(() => abortCtl.abort(), 15 * 60 * 1000)
-    res.on('close', () => { if (!abortCtl.signal.aborted) abortCtl.abort() })
 
     // Procesar en background — el usuario puede salir
     setImmediate(async () => {
@@ -1769,6 +1843,258 @@ async function renovarCreditosMensual() {
   }
 }
 cron.schedule('5 0 1 * *', renovarCreditosMensual, { timezone: 'America/Santiago' })
+
+// ── SUSCRIPCIONES ──────────────────────────────────────────────────────────
+// Catálogo de planes pagos. El free ('aprobado') no aparece acá porque no
+// pasa por Khipu; se maneja implícito como estado por defecto.
+const PLANES_CONFIG = {
+  con_distincion: {
+    nombre: 'Con Distinción',
+    monto: 2990,
+    creditos_mes: 400,
+    descripcion: 'Plan Con Distinción APPrueba'
+  },
+  con_distincion_maxima: {
+    nombre: 'Con Distinción Máxima',
+    monto: 4990,
+    creditos_mes: 1200,
+    descripcion: 'Plan Con Distinción Máxima APPrueba'
+  }
+}
+
+// POST /suscripcion/iniciar — genera link de pago Khipu
+app.post('/suscripcion/iniciar', authenticateToken, async (req, res) => {
+  try {
+    const { plan } = req.body
+    if (!PLANES_CONFIG[plan]) {
+      return res.status(400).json({ error: 'Plan inválido', planes_disponibles: Object.keys(PLANES_CONFIG) })
+    }
+    const config = PLANES_CONFIG[plan]
+    const transactionId = `APR-${req.user.id}-${Date.now()}`
+    const clientUrl = process.env.CLIENT_URL || 'https://apprueba-production.up.railway.app'
+
+    let pagoData
+    try {
+      pagoData = await khipuCrearPago({
+        subject: config.descripcion,
+        amount: config.monto,
+        currency: 'CLP',
+        returnUrl: `${clientUrl}/planes?pago=exitoso`,
+        cancelUrl: `${clientUrl}/planes?pago=cancelado`,
+        transactionId,
+        customerId: String(req.user.id)
+      })
+    } catch (khipuErr) {
+      console.error('[Khipu] error creando pago:', khipuErr?.response?.data || khipuErr.message)
+      return res.status(502).json({ error: 'error_khipu', detalle: khipuErr?.response?.data?.message || khipuErr.message })
+    }
+
+    await pool.query(
+      `INSERT INTO pagos_khipu (usuario_id, payment_id, plan, monto, estado, khipu_url, khipu_response)
+       VALUES ($1, $2, $3, $4, 'pendiente', $5, $6)`,
+      [req.user.id, pagoData.payment_id, plan, config.monto, pagoData.payment_url, JSON.stringify(pagoData)]
+    )
+
+    res.json({
+      ok: true,
+      payment_id: pagoData.payment_id,
+      payment_url: pagoData.payment_url,
+      simplified_transfer_url: pagoData.simplified_transfer_url,
+      plan,
+      monto: config.monto
+    })
+  } catch (err) {
+    console.error('[suscripcion/iniciar]', err.message)
+    res.status(500).json({ error: 'error_interno' })
+  }
+})
+
+// POST /suscripcion/webhook — Khipu golpea acá cuando el pago cambia de estado.
+// Usa urlencoded parser inline porque el body de Khipu viene así, no JSON.
+app.post('/suscripcion/webhook', express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { notification_token, payment_id } = req.body
+    if (!payment_id) return res.status(400).json({ error: 'sin payment_id' })
+
+    let pagoKhipu
+    try {
+      pagoKhipu = await khipuVerificarPago(payment_id)
+    } catch (err) {
+      console.error('[webhook] error verificando con Khipu:', err.message)
+      return res.status(502).json({ error: 'no_se_pudo_verificar' })
+    }
+
+    if (pagoKhipu.status !== 'done') {
+      await pool.query(
+        `UPDATE pagos_khipu SET estado = $1, khipu_response = $2, updated_at = NOW() WHERE payment_id = $3`,
+        [pagoKhipu.status, JSON.stringify(pagoKhipu), payment_id]
+      )
+      return res.json({ ok: true, estado: pagoKhipu.status })
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM pagos_khipu WHERE payment_id = $1`,
+      [payment_id]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'pago_no_encontrado' })
+    const pago = rows[0]
+    // Idempotencia: Khipu puede reintentar el webhook; si ya aplicamos el
+    // pago, salimos sin volver a dar créditos.
+    if (pago.estado === 'completado') return res.json({ ok: true, ya_procesado: true })
+
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const config = PLANES_CONFIG[pago.plan]
+      const ahora = new Date()
+      const vence = new Date(ahora)
+      vence.setMonth(vence.getMonth() + 1)
+
+      await client.query(
+        `UPDATE usuarios SET
+          plan = $1,
+          suscripcion_activa = true,
+          suscripcion_vence_en = $2,
+          creditos_suscripcion = COALESCE(creditos_suscripcion, 0) + $3,
+          creditos_total = COALESCE(creditos_total, 0) + $3
+         WHERE id = $4`,
+        [pago.plan, vence, config.creditos_mes, pago.usuario_id]
+      )
+
+      await client.query(
+        `UPDATE pagos_khipu SET estado = 'completado', khipu_response = $1, updated_at = NOW() WHERE payment_id = $2`,
+        [JSON.stringify(pagoKhipu), payment_id]
+      )
+
+      await client.query(
+        `INSERT INTO suscripciones_historial (usuario_id, plan, accion, motivo) VALUES ($1, $2, 'activar', 'pago_khipu')`,
+        [pago.usuario_id, pago.plan]
+      )
+
+      await client.query(
+        `INSERT INTO creditos_transacciones (usuario_id, cantidad, tipo, motivo) VALUES ($1, $2, 'suscripcion', $3)`,
+        [pago.usuario_id, config.creditos_mes, `activacion_plan_${pago.plan}`]
+      )
+
+      await client.query('COMMIT')
+      console.log(`[webhook] suscripción activada usuario=${pago.usuario_id} plan=${pago.plan}`)
+
+      // Push de confirmación (best-effort, no bloquea la respuesta).
+      const { rows: subs } = await pool.query(
+        `SELECT subscription FROM push_subscriptions WHERE usuario_id = $1 LIMIT 3`,
+        [pago.usuario_id]
+      )
+      const payload = buildPushPayload({
+        title: '¡Suscripción activada! 🎉',
+        body: `Tu plan ${config.nombre} está activo. Tienes ${config.creditos_mes} créditos nuevos.`,
+        url: 'https://apprueba.com/planes'
+      })
+      for (const sub of subs) {
+        enviarPushYLimpiar(sub, payload, 'suscripcion').catch(() => {})
+      }
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw err
+    } finally {
+      client.release()
+    }
+
+    res.json({ ok: true, plan: pago.plan })
+  } catch (err) {
+    console.error('[suscripcion/webhook]', err.message)
+    res.status(500).json({ error: 'error_interno' })
+  }
+})
+
+// GET /suscripcion/estado — estado + últimos pagos del usuario autenticado.
+app.get('/suscripcion/estado', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT plan, suscripcion_activa, suscripcion_vence_en,
+              COALESCE(creditos_total, 0) AS creditos_total,
+              COALESCE(creditos_suscripcion, 0) AS creditos_suscripcion
+       FROM usuarios WHERE id = $1`,
+      [req.user.id]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'usuario_no_encontrado' })
+    const u = rows[0]
+
+    const { rows: pagos } = await pool.query(
+      `SELECT plan, monto, estado, created_at FROM pagos_khipu
+       WHERE usuario_id = $1 ORDER BY created_at DESC LIMIT 5`,
+      [req.user.id]
+    )
+
+    res.json({
+      plan: u.plan || 'aprobado',
+      suscripcion_activa: u.suscripcion_activa || false,
+      suscripcion_vence_en: u.suscripcion_vence_en,
+      creditos_total: u.creditos_total,
+      creditos_suscripcion: u.creditos_suscripcion,
+      planes_disponibles: PLANES_CONFIG,
+      pagos_recientes: pagos
+    })
+  } catch (err) {
+    console.error('[suscripcion/estado]', err.message)
+    res.status(500).json({ error: 'error_interno' })
+  }
+})
+
+// POST /suscripcion/cancelar — marca la suscripción como cancelada.
+// No hay reembolso automático — los créditos ya otorgados se mantienen.
+app.post('/suscripcion/cancelar', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT plan, suscripcion_activa FROM usuarios WHERE id = $1`,
+      [req.user.id]
+    )
+    if (!rows.length || !rows[0].suscripcion_activa) {
+      return res.status(400).json({ error: 'sin_suscripcion_activa' })
+    }
+    const planActual = rows[0].plan
+
+    await pool.query(
+      `UPDATE usuarios SET suscripcion_activa = false, suscripcion_vence_en = NOW(),
+       plan = 'aprobado' WHERE id = $1`,
+      [req.user.id]
+    )
+    await pool.query(
+      `INSERT INTO suscripciones_historial (usuario_id, plan, accion, motivo) VALUES ($1, $2, 'cancelar', 'solicitud_usuario')`,
+      [req.user.id, planActual]
+    )
+    res.json({ ok: true, mensaje: 'Suscripción cancelada. Los créditos ganados no se eliminan.' })
+  } catch (err) {
+    console.error('[suscripcion/cancelar]', err.message)
+    res.status(500).json({ error: 'error_interno' })
+  }
+})
+
+// Cron diario 01:00 (America/Santiago): desactiva suscripciones vencidas y
+// las deja en plan 'aprobado'. El cron mensual de renovación de créditos
+// se salta a estos usuarios porque ya quedan con suscripcion_activa=false.
+cron.schedule('0 1 * * *', async () => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE usuarios
+         SET suscripcion_activa = false, plan = 'aprobado'
+       WHERE suscripcion_activa = true
+         AND suscripcion_vence_en IS NOT NULL
+         AND suscripcion_vence_en < NOW()
+       RETURNING id, plan`
+    )
+    if (rows.length > 0) {
+      console.log(`[cron suscripciones] ${rows.length} suscripciones expiradas`)
+      for (const u of rows) {
+        await pool.query(
+          `INSERT INTO suscripciones_historial (usuario_id, plan, accion, motivo) VALUES ($1, $2, 'expirar', 'vencimiento_automatico')`,
+          [u.id, u.plan]
+        ).catch(() => {})
+      }
+    }
+  } catch (err) {
+    console.error('[cron suscripciones] error:', err.message)
+  }
+}, { timezone: 'America/Santiago' })
 
 // ── NOVEDADES ─────────────────────────────────────────────────────
 // ── NOVEDADES · cache + scraping UFRO ─────────────────────────────
@@ -4242,10 +4568,10 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     const usuarioId = req.user.id
     const evalId = req.params.id
 
-    // Abort si el cliente cierra o si pasan 15 min (generación colgada).
+    // Abort solo por timeout (15 min). No abortar por cierre del cliente
+    // — en móvil el SSE se cierra por red inestable o cambio de app.
     const abortCtl = new AbortController()
     const abortTimer = setTimeout(() => abortCtl.abort(), 15 * 60 * 1000)
-    res.on('close', () => { if (!abortCtl.signal.aborted) abortCtl.abort() })
 
     setImmediate(async () => {
       try {
