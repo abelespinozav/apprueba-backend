@@ -639,6 +639,17 @@ async function initDB() {
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ejercicios_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS quizzes_usados INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS planes_usados INTEGER DEFAULT 0;
+    -- Fase 0 del sistema de créditos. Los contadores _usados de arriba
+    -- quedan intactos por ahora; solo se reemplaza la validación.
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS creditos_total INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS creditos_suscripcion INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS creditos_gamificacion INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS creditos_comprados INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'aprobado';
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS suscripcion_activa BOOLEAN DEFAULT false;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS suscripcion_vence_en TIMESTAMP;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp_total INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nivel INTEGER DEFAULT 1;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_examen DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_final DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS estado_final VARCHAR(50);
@@ -675,6 +686,15 @@ async function initDB() {
     )
     UPDATE usuarios u SET numero_registro = (SELECT n FROM max_actual) + p.idx
     FROM pendientes p WHERE u.id = p.id
+  `)
+  // Seed único de créditos: cada usuario existente con saldo 0 recibe 150
+  // "comprados" para no quedar bloqueado al migrar al nuevo sistema. Los
+  // nuevos usuarios reciben su bono vía otorgarCreditos() en /auth/register
+  // y el callback de Google OAuth, así que esta query no los pisa dos veces.
+  await pool.query(`
+    UPDATE usuarios
+       SET creditos_comprados = 150, creditos_total = 150
+     WHERE creditos_total = 0
   `)
   console.log('Base de datos lista ✅')
 }
@@ -729,6 +749,10 @@ passport.use(new GoogleStrategy({
         usuario.es_fundador = true
         usuario.numero_registro = upd[0]?.numero_registro
       }
+      // Bono de bienvenida: 150 créditos de regalo al registrarse.
+      await otorgarCreditos(usuario.id, 150, 'registro').catch(err =>
+        console.error('otorgarCreditos(registro) OAuth falló:', err.message)
+      )
     }
 
     return done(null, usuario)
@@ -766,6 +790,10 @@ app.post('/auth/register', async (req, res) => {
       usuario.es_fundador = true
       usuario.numero_registro = upd[0]?.numero_registro
     }
+    // Bono de bienvenida: 150 créditos de regalo al registrarse.
+    await otorgarCreditos(usuario.id, 150, 'registro').catch(err =>
+      console.error('otorgarCreditos(registro) email falló:', err.message)
+    )
     const token = jwt.sign({ id: usuario.id, email: usuario.email, nombre: usuario.nombre }, process.env.JWT_SECRET, { expiresIn: '7d' })
     res.json({ token, usuario })
   } catch (err) {
@@ -872,6 +900,29 @@ app.patch('/auth/perfil', authenticateToken, async (req, res) => {
 app.post('/auth/logout', (req, res) => {
   res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'none' })
   res.json({ ok: true })
+})
+
+// Saldo de créditos y estado de suscripción del usuario autenticado.
+// El frontend consulta este endpoint para mostrar el saldo en header/modal
+// y decidir si habilitar los botones de generación.
+app.get('/usuarios/creditos', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(creditos_total, 0) AS total,
+              COALESCE(creditos_suscripcion, 0) AS suscripcion,
+              COALESCE(creditos_gamificacion, 0) AS gamificacion,
+              COALESCE(creditos_comprados, 0) AS comprados,
+              COALESCE(plan, 'aprobado') AS plan,
+              suscripcion_vence_en
+         FROM usuarios WHERE id = $1`,
+      [req.user.id]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' })
+    res.json(rows[0])
+  } catch (err) {
+    console.error('Error GET /usuarios/creditos:', err)
+    res.status(500).json({ error: 'Error al obtener créditos' })
+  }
 })
 
 function authenticateToken(req, res, next) {
@@ -1155,6 +1206,71 @@ async function resolverLimite(userId, tipo) {
   return global ? parseInt(global) : 100
 }
 
+// ─── Sistema de créditos (Fase 0) ────────────────────────────────────────
+// Los créditos viven en tres columnas (suscripcion, gamificacion, comprados)
+// y creditos_total es la suma cacheada para queries rápidas. El invariante
+// total = suscripcion + gamificacion + comprados se mantiene en cada helper.
+
+// Suma `cantidad` a la columna correspondiente al `tipo` y recalcula total.
+// 'registro' y 'comprado' caen en creditos_comprados (el bono inicial queda
+// en el mismo bucket que las compras para simplificar reportes).
+async function otorgarCreditos(usuarioId, cantidad, tipo) {
+  const columnas = {
+    suscripcion:  'creditos_suscripcion',
+    gamificacion: 'creditos_gamificacion',
+    comprado:     'creditos_comprados',
+    registro:     'creditos_comprados'
+  }
+  const col = columnas[tipo]
+  if (!col) throw new Error(`Tipo de crédito inválido: ${tipo}`)
+  if (!Number.isFinite(cantidad) || cantidad <= 0) throw new Error('Cantidad de créditos inválida')
+  const { rows } = await pool.query(
+    `UPDATE usuarios
+        SET ${col} = COALESCE(${col}, 0) + $2,
+            creditos_total = COALESCE(creditos_total, 0) + $2
+      WHERE id = $1
+      RETURNING creditos_total`,
+    [usuarioId, cantidad]
+  )
+  return rows[0]?.creditos_total ?? 0
+}
+
+// Verifica saldo y descuenta atómicamente en un solo UPDATE. Como Postgres
+// evalúa todas las expresiones SET con los valores ANTERIORES, la cascada
+// (gamificacion → suscripcion → comprados) funciona sin necesidad de
+// transacción explícita. El WHERE asegura que dos requests simultáneos no
+// puedan ambas pasar el chequeo (si el primero baja el total, el segundo
+// ve creditos_total < costo y no actualiza).
+async function verificarYDescontarCreditos(usuarioId, costo) {
+  if (!Number.isFinite(costo) || costo <= 0) throw new Error('Costo de créditos inválido')
+  const { rows } = await pool.query(
+    `UPDATE usuarios SET
+        creditos_gamificacion = GREATEST(COALESCE(creditos_gamificacion, 0) - $2, 0),
+        creditos_suscripcion  = GREATEST(
+          COALESCE(creditos_suscripcion, 0)
+          - GREATEST($2 - COALESCE(creditos_gamificacion, 0), 0),
+          0
+        ),
+        creditos_comprados    = GREATEST(
+          COALESCE(creditos_comprados, 0)
+          - GREATEST($2 - COALESCE(creditos_gamificacion, 0) - COALESCE(creditos_suscripcion, 0), 0),
+          0
+        ),
+        creditos_total        = COALESCE(creditos_total, 0) - $2
+      WHERE id = $1 AND COALESCE(creditos_total, 0) >= $2
+      RETURNING creditos_total`,
+    [usuarioId, costo]
+  )
+  if (rows.length === 0) {
+    const { rows: actual } = await pool.query(
+      'SELECT COALESCE(creditos_total, 0) AS saldo FROM usuarios WHERE id = $1',
+      [usuarioId]
+    )
+    return { ok: false, saldo: actual[0]?.saldo ?? 0 }
+  }
+  return { ok: true, saldo: rows[0].creditos_total }
+}
+
 async function callOpenAIWithRetry(params, maxRetries = 2) {
   // signal va como 2º argumento (options) en el SDK, no dentro del body.
   // Antes se pasaba en params y la API devolvía 400 "Unrecognized request
@@ -1312,17 +1428,15 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     if ((!ev.archivos || ev.archivos.length === 0) && youtubeUrlsArr.length === 0) {
       return terminar('error', { error: 'sin_material', mensaje: 'Debes subir material de estudio para generar el plan.' })
     }
-    // BLOQUEO: límite de regeneraciones (solo si ya tiene plan).
-    // Check-and-set atómico: previene race condition (dos requests pasando el
-    // check simultáneamente y gastando cupo doble). Si la IA falla después,
-    // se hace refund decrementando el contador.
+    // Créditos: solo cobramos regeneraciones del plan (la primera vez es
+    // gratis). verificarYDescontarCreditos es atómica, así que dos requests
+    // concurrentes no pueden gastar saldo doble.
     if (ev.plan_estudio) {
-      const limiteP = await resolverLimite(req.user.id, 'planes')
-      const { rowCount } = await pool.query(
-        'UPDATE usuarios SET planes_usados = planes_usados + 1 WHERE id = $1 AND planes_usados < $2',
-        [req.user.id, limiteP]
-      )
-      if (rowCount === 0) return terminar('error', { error: 'limite_alcanzado', mensaje: 'Alcanzaste el límite de regeneraciones del plan de estudio.' })
+      const COSTO_PLAN = 15
+      const creditos = await verificarYDescontarCreditos(req.user.id, COSTO_PLAN)
+      if (!creditos.ok) {
+        return terminar('error', { error: 'creditos_insuficientes', saldo: creditos.saldo, creditos_necesarios: COSTO_PLAN })
+      }
       planContadoEnLimite = true
     }
     // Detectar archivos que fallaron
@@ -1369,7 +1483,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         clearTimeout(abortTimer)
         await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
         if (planContadoEnLimite) {
-          await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
+          await otorgarCreditos(usuarioId, 15, 'comprado').catch(()=>{})
         }
         const abortado = err?.name === 'AbortError' || abortCtl.signal.aborted
         terminar('error', {
@@ -1439,7 +1553,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     console.error('Error generando plan:', err)
     await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
     if (planContadoEnLimite) {
-      await pool.query('UPDATE usuarios SET planes_usados = GREATEST(planes_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+      await otorgarCreditos(req.user.id, 15, 'comprado').catch(()=>{})
     }
     try { terminar('error', { error: 'error_interno', mensaje: 'Error al generar plan de estudio' }) } catch(_) {}
   }
@@ -3506,18 +3620,14 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
   try {
     const evId = req.params.id
     const tareaIdx = req.body.tareaIdx ?? null
-    // Check-and-set atómico antes de invocar IA (previene race condition).
-    const limiteGlobal = await resolverLimite(userId, 'podcasts')
-    const { rows: incRows } = await pool.query(
-      'UPDATE usuarios SET podcasts_usados = podcasts_usados + 1 WHERE id = $1 AND podcasts_usados < $2 RETURNING podcasts_usados',
-      [userId, limiteGlobal]
-    )
-    if (incRows.length === 0) {
-      const cur = await pool.query('SELECT podcasts_usados FROM usuarios WHERE id = $1', [userId])
-      return res.status(403).json({ error: 'limite_alcanzado', usados: cur.rows[0]?.podcasts_usados || limiteGlobal, limite: limiteGlobal })
+    // Créditos: cobro atómico antes de invocar IA (evita race condition).
+    const COSTO_PODCAST = 30
+    const creditos = await verificarYDescontarCreditos(userId, COSTO_PODCAST)
+    if (!creditos.ok) {
+      return res.status(403).json({ error: 'creditos_insuficientes', saldo: creditos.saldo, creditos_necesarios: COSTO_PODCAST })
     }
     podcastContadoEnLimite = true
-    const usados = incRows[0].podcasts_usados - 1 // valor previo, para compat con header X-Podcasts-Usados
+    const usados = 0 // header X-Podcasts-Usados queda legacy; frontend ahora lee /usuarios/creditos
     const evRes = await pool.query(
       `SELECT e.*, r.nombre as ramo_nombre, e.texto_material, e.plan_estudio FROM evaluaciones e JOIN ramos r ON r.id = e.ramo_id WHERE e.id = $1 AND r.usuario_id = $2`,
       [evId, userId]
@@ -3581,7 +3691,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
     if (!process.env.AZURE_TTS_KEY || !process.env.AZURE_TTS_REGION) {
       console.error('[podcast] Azure TTS no configurado: falta AZURE_TTS_KEY o AZURE_TTS_REGION en env')
       if (podcastContadoEnLimite) {
-        await pool.query('UPDATE usuarios SET podcasts_usados = GREATEST(podcasts_usados - 1, 0) WHERE id = $1', [userId]).catch(()=>{})
+        await otorgarCreditos(userId, 30, 'comprado').catch(()=>{})
       }
       return res.status(503).json({
         error: 'servicio_no_configurado',
@@ -3674,7 +3784,7 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
   } catch(err) {
     console.error('Error generando podcast:', err)
     if (podcastContadoEnLimite) {
-      await pool.query('UPDATE usuarios SET podcasts_usados = GREATEST(podcasts_usados - 1, 0) WHERE id = $1', [userId]).catch(()=>{})
+      await otorgarCreditos(userId, 30, 'comprado').catch(()=>{})
     }
     res.status(500).json({ error: 'Error generando podcast' })
   }
@@ -3686,6 +3796,7 @@ app.listen(process.env.PORT || 3001, () => console.log(`Backend corriendo en pue
 
 // Generar o recuperar guía de estudio para una tarea específica
 app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => {
+  let guiaContadoEnLimite = false
   try {
     const { tarea, tareaIndex, forzar } = req.body
     const { rows: evRows } = await pool.query(
@@ -3699,12 +3810,20 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
 
-    // Si ya existe la guía y no se fuerza regenerar, devolverla
+    // Si ya existe la guía y no se fuerza regenerar, devolverla (sin cobrar)
     const guiasGuardadas = ev.guias_tareas || {}
     const key = String(tareaIndex)
     if (guiasGuardadas[key] && !forzar) {
       return res.json({ ...guiasGuardadas[key], cached: true })
     }
+
+    // Créditos: cobro atómico antes de generar.
+    const COSTO_GUIA = 8
+    const creditosG = await verificarYDescontarCreditos(req.user.id, COSTO_GUIA)
+    if (!creditosG.ok) {
+      return res.status(403).json({ error: 'creditos_insuficientes', saldo: creditosG.saldo, creditos_necesarios: COSTO_GUIA })
+    }
+    guiaContadoEnLimite = true
 
     let contenidoArchivos = ''
     // Siempre re-extraer desde archivos en BD para tener contenido actualizado
@@ -3787,6 +3906,9 @@ Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con ins
     res.json(guia)
   } catch (err) {
     console.error('Error generando guía:', err)
+    if (guiaContadoEnLimite) {
+      await otorgarCreditos(req.user.id, 8, 'comprado').catch(()=>{})
+    }
     res.status(500).json({ error: 'Error al generar guía de estudio' })
   }
 })
@@ -3935,20 +4057,16 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
     if (!evRows[0]) return res.status(404).json({ error: 'Evaluación no encontrada' })
     const ev = evRows[0]
     if (ev.quiz_generado && !forzar) return res.json({ preguntas: ev.quiz_generado, cached: true })
-    // Check-and-set atómico antes de la IA.
-    const limiteGlobalQ = await resolverLimite(req.user.id, 'quizzes')
-    const { rows: incQ } = await pool.query(
-      'UPDATE usuarios SET quizzes_usados = quizzes_usados + 1 WHERE id = $1 AND quizzes_usados < $2 RETURNING quizzes_usados',
-      [req.user.id, limiteGlobalQ]
-    )
-    if (incQ.length === 0) {
-      const cur = await pool.query('SELECT quizzes_usados FROM usuarios WHERE id = $1', [req.user.id])
-      return res.status(403).json({ error: 'limite_alcanzado', tipo: 'quizzes', usados: cur.rows[0]?.quizzes_usados || limiteGlobalQ, limite: limiteGlobalQ })
+    // Créditos: cobro atómico antes de la IA.
+    const COSTO_QUIZ = 10
+    const creditosQ = await verificarYDescontarCreditos(req.user.id, COSTO_QUIZ)
+    if (!creditosQ.ok) {
+      return res.status(403).json({ error: 'creditos_insuficientes', saldo: creditosQ.saldo, creditos_necesarios: COSTO_QUIZ })
     }
     quizContadoEnLimite = true
     if (!ev.texto_material && (!ev.archivos || ev.archivos.length === 0)) {
       // Refund inmediato — no se va a llamar IA.
-      await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [req.user.id])
+      await otorgarCreditos(req.user.id, COSTO_QUIZ, 'comprado').catch(()=>{})
       return res.status(400).json({ error: 'Debes subir material de estudio para generar el quiz' })
     }
 
@@ -4083,8 +4201,8 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         console.error('Error generando quiz:', err)
         clearTimeout(abortTimer)
         const abortado = err?.name === 'AbortError' || abortCtl.signal.aborted
-        // Refund: IA falló o fue cancelada, devolvemos el cupo.
-        await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [usuarioId]).catch(()=>{})
+        // Refund: IA falló o fue cancelada, devolvemos los créditos.
+        await otorgarCreditos(usuarioId, 10, 'comprado').catch(()=>{})
         enviar('error', {
           error: abortado ? 'cancelado' : 'fallo_ia',
           mensaje: abortado ? 'La generación fue cancelada.' : 'Error al generar quiz: ' + err.message
@@ -4095,7 +4213,7 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
   } catch (err) {
     console.error('Error generando quiz:', err)
     if (quizContadoEnLimite) {
-      await pool.query('UPDATE usuarios SET quizzes_usados = GREATEST(quizzes_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+      await otorgarCreditos(req.user.id, 10, 'comprado').catch(()=>{})
     }
     res.status(500).json({ error: 'Error al generar quiz: ' + err.message })
   }
@@ -4131,15 +4249,11 @@ app.post('/evaluaciones/:id/ejercicios-pdf', authenticateToken, async (req, res)
       }
     }
 
-    // Check-and-set atómico antes de la IA.
-    const limiteGlobalE = await resolverLimite(req.user.id, 'ejercicios')
-    const { rows: incE } = await pool.query(
-      'UPDATE usuarios SET ejercicios_usados = ejercicios_usados + 1 WHERE id = $1 AND ejercicios_usados < $2 RETURNING ejercicios_usados',
-      [req.user.id, limiteGlobalE]
-    )
-    if (incE.length === 0) {
-      const cur = await pool.query('SELECT ejercicios_usados FROM usuarios WHERE id = $1', [req.user.id])
-      return res.status(403).json({ error: 'limite_alcanzado', tipo: 'ejercicios', usados: cur.rows[0]?.ejercicios_usados || limiteGlobalE, limite: limiteGlobalE })
+    // Créditos: cobro atómico antes de la IA.
+    const COSTO_EJ = 12
+    const creditosEj = await verificarYDescontarCreditos(req.user.id, COSTO_EJ)
+    if (!creditosEj.ok) {
+      return res.status(403).json({ error: 'creditos_insuficientes', saldo: creditosEj.saldo, creditos_necesarios: COSTO_EJ })
     }
     ejContadoEnLimite = true
 
@@ -4393,7 +4507,7 @@ Responde SOLO con JSON válido:
   } catch(e) {
     console.error('Error ejercicios PDF:', e)
     if (ejContadoEnLimite) {
-      await pool.query('UPDATE usuarios SET ejercicios_usados = GREATEST(ejercicios_usados - 1, 0) WHERE id = $1', [req.user.id]).catch(()=>{})
+      await otorgarCreditos(req.user.id, 12, 'comprado').catch(()=>{})
     }
     if (!res.headersSent) res.status(500).json({ error: 'Error generando ejercicios' })
   }
