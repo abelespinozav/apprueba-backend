@@ -728,6 +728,20 @@ async function initDB() {
     ALTER TABLE novedades ADD COLUMN IF NOT EXISTS expira_en TIMESTAMP;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS generaciones_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      tipo TEXT NOT NULL,
+      ramo_nombre TEXT,
+      creditos_usados INTEGER DEFAULT 0,
+      fecha_creacion TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_generaciones_historial_usuario
+    ON generaciones_historial(usuario_id, fecha_creacion DESC)
+  `)
   // Backfill/normaliza numero_registro de fundadores por orden de created_at.
   // Backfill incremental: solo asigna numero_registro a fundadores que aún
   // no lo tienen (NULL). Antes usaba ROW_NUMBER sobre TODOS los fundadores,
@@ -987,6 +1001,22 @@ app.get('/usuarios/gamificacion', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Error GET /usuarios/gamificacion:', err)
     res.status(500).json({ error: 'Error al obtener gamificación' })
+  }
+})
+
+app.get('/usuarios/historial-generaciones', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT tipo, ramo_nombre, fecha_creacion, creditos_usados
+      FROM generaciones_historial
+      WHERE usuario_id = $1
+      ORDER BY fecha_creacion DESC
+      LIMIT 50
+    `, [req.user.id])
+    res.json({ historial: rows })
+  } catch (err) {
+    console.error('Error historial generaciones:', err)
+    res.status(500).json({ error: 'error_interno' })
   }
 })
 
@@ -1935,6 +1965,10 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         }
         clearTimeout(abortTimer)
         terminar('plan', { plan })
+        await pool.query(
+          `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'plan', $2, 15)`,
+          [usuarioId, ev.ramo_nombre || 'Plan']
+        ).catch(() => {})
         desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
         // Notificar al usuario
         await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
@@ -1959,6 +1993,10 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
           await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
           clearTimeout(abortTimer)
           terminar('plan', { plan: plan2 })
+          await pool.query(
+            `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'plan', $2, 15)`,
+            [usuarioId, ev.ramo_nombre || 'Plan']
+          ).catch(() => {})
           desbloquearLogro(usuarioId, 'primer_plan').catch(() => {})
           await notificarUsuario(usuarioId, '📚 ¡Tu plan de estudio está listo!', `El plan para "${nombreEval}" ya está disponible.`, '/')
         } catch(fallbackErr) {
@@ -4506,6 +4544,10 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
       'INSERT INTO podcasts (evaluacion_id, tarea_idx, titulo, audio) VALUES ($1, $2, $3, $4) ON CONFLICT (evaluacion_id, tarea_idx) DO UPDATE SET titulo = $3, audio = $4',
       [evId, tareaIdx ?? 0, tituloFinal, audioBase64]
     )
+    await pool.query(
+      `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'podcast', $2, 30)`,
+      [userId, ev.ramo_nombre || 'Podcast']
+    ).catch(() => {})
     res.set({ 'Content-Type': 'audio/mpeg', 'X-Podcasts-Usados': usados + 1, 'X-Podcast-Titulo': encodeURIComponent(tituloFinal) })
     res.send(audioFinal)
     // Push al final. El user pidió podcast y es útil si cerró la tab mientras
@@ -4637,6 +4679,10 @@ Genera 4 conceptos clave con trucos mnemotécnicos, 3 ejemplos resueltos con ins
     // Guardar guía en DB
     guiasGuardadas[key] = guia
     await pool.query('UPDATE evaluaciones SET guias_tareas = $1 WHERE id = $2', [JSON.stringify(guiasGuardadas), req.params.id])
+    await pool.query(
+      `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'guia', $2, 8)`,
+      [req.user.id, ev.ramo_nombre || 'Guía']
+    ).catch(() => {})
 
     res.json(guia)
   } catch (err) {
@@ -4925,6 +4971,10 @@ IMPORTANTE: La respuesta correcta debe distribuirse aleatoriamente entre A, B, C
         })
         enviar('progreso', { msg: '✅ Quiz generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET quiz_generado = $1 WHERE id = $2', [JSON.stringify(quizData.preguntas), evalId])
+        await pool.query(
+          `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'quiz', $2, 10)`,
+          [usuarioId, ev.ramo_nombre || 'Quiz']
+        ).catch(() => {})
         // Contador ya incrementado atómicamente antes del setImmediate.
         clearTimeout(abortTimer)
         enviar('quiz', { preguntas: quizData.preguntas })
@@ -5038,6 +5088,10 @@ Responde SOLO con JSON válido:
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader('Content-Disposition', `attachment; filename="ejercicios-${tareaIndex+1}.pdf"`)
       res.send(pdfBuf)
+      await pool.query(
+        `INSERT INTO generaciones_historial (usuario_id, tipo, ramo_nombre, creditos_usados) VALUES ($1, 'ejercicios', $2, 12)`,
+        [req.user.id, ev.ramo_nombre || 'Ejercicios']
+      ).catch(() => {})
       await notificarUsuario(
         req.user.id,
         '📄 ¡Tus ejercicios están listos!',
