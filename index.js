@@ -593,6 +593,23 @@ async function initDB() {
       clave TEXT PRIMARY KEY,
       valor TEXT NOT NULL
     );
+    -- Fase 1 de créditos: bitácoras de XP y movimientos de crédito.
+    CREATE TABLE IF NOT EXISTS xp_historial (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      xp INTEGER NOT NULL,
+      creditos INTEGER NOT NULL DEFAULT 0,
+      motivo TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS creditos_transacciones (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+      cantidad INTEGER NOT NULL,
+      tipo TEXT NOT NULL,
+      motivo TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS horario (
       id SERIAL PRIMARY KEY,
       usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -650,6 +667,9 @@ async function initDB() {
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS suscripcion_vence_en TIMESTAMP;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp_total INTEGER DEFAULT 0;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nivel INTEGER DEFAULT 1;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS racha_dias INTEGER DEFAULT 0;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultima_actividad DATE;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mejor_racha INTEGER DEFAULT 0;
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_examen DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS nota_final DECIMAL(3,1);
     ALTER TABLE ramos ADD COLUMN IF NOT EXISTS estado_final VARCHAR(50);
@@ -902,6 +922,35 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true })
 })
 
+// Estado de gamificación del usuario (XP, nivel, racha) + últimas 5
+// entradas del historial para renderizar el feed "cómo ganaste XP".
+app.get('/usuarios/gamificacion', authenticateToken, async (req, res) => {
+  try {
+    const { rows: uRows } = await pool.query(
+      `SELECT COALESCE(xp_total, 0) AS xp_total,
+              COALESCE(nivel, 1) AS nivel,
+              COALESCE(racha_dias, 0) AS racha_dias,
+              COALESCE(mejor_racha, 0) AS mejor_racha,
+              ultima_actividad
+         FROM usuarios WHERE id = $1`,
+      [req.user.id]
+    )
+    if (!uRows[0]) return res.status(404).json({ error: 'Usuario no encontrado' })
+    const { rows: historial } = await pool.query(
+      `SELECT id, xp, creditos, motivo, created_at
+         FROM xp_historial
+        WHERE usuario_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 5`,
+      [req.user.id]
+    )
+    res.json({ ...uRows[0], historial })
+  } catch (err) {
+    console.error('Error GET /usuarios/gamificacion:', err)
+    res.status(500).json({ error: 'Error al obtener gamificación' })
+  }
+})
+
 // Saldo de créditos y estado de suscripción del usuario autenticado.
 // El frontend consulta este endpoint para mostrar el saldo en header/modal
 // y decidir si habilitar los botones de generación.
@@ -1030,6 +1079,16 @@ app.post('/ramos', authenticateToken, async (req, res) => {
 app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
   try {
     const { nota } = req.body
+    // Detecta si estamos registrando una nota por PRIMERA vez (vs. editar o
+    // limpiar). Solo en ese caso otorgamos XP — evita farming de XP al pasar
+    // la misma nota dos veces.
+    const { rows: prev } = await pool.query(
+      `SELECT nota FROM evaluaciones
+        WHERE id = $1 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $2)`,
+      [req.params.id, req.user.id]
+    )
+    if (prev.length === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
+    const notaPrevia = prev[0].nota
     const { rowCount } = await pool.query(
       `UPDATE evaluaciones SET nota = $1
        WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
@@ -1037,6 +1096,10 @@ app.put('/evaluaciones/:id/nota', authenticateToken, async (req, res) => {
     )
     if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
     res.json({ ok: true })
+    // Solo recompensa cuando pasa de "sin nota" a "con nota" — editar no suma XP.
+    if (notaPrevia == null && nota != null && nota !== '') {
+      otorgarXP(req.user.id, 80, 5, 'registrar_nota').catch(e => console.error('otorgarXP registrar_nota:', e.message))
+    }
   } catch (err) {
     console.error('Error actualizando nota:', err)
     res.status(500).json({ error: 'Error al guardar la nota' })
@@ -1085,6 +1148,7 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
       [req.params.id, req.file.originalname, req.file.mimetype, req.file.buffer]
     )
     res.json(rows[0])
+    otorgarXP(req.user.id, 50, 10, 'subir_material').catch(e => console.error('otorgarXP subir_material:', e.message))
   } catch (err) {
     console.error('Error subiendo archivo:', err)
     res.status(500).json({ error: 'Error al subir archivo' })
@@ -1269,6 +1333,36 @@ async function verificarYDescontarCreditos(usuarioId, costo) {
     return { ok: false, saldo: actual[0]?.saldo ?? 0 }
   }
   return { ok: true, saldo: rows[0].creditos_total }
+}
+
+// Suma XP al usuario, opcionalmente otorga créditos de gamificación y
+// deja rastro en xp_historial (+creditos_transacciones si hubo créditos).
+// Úsalo DESPUÉS de que la operación principal haya sido exitosa: si algo
+// de acá falla, solo loggeamos — nunca revertimos la operación del usuario.
+async function otorgarXP(usuarioId, xp, creditos, motivo) {
+  if (!Number.isFinite(xp) || xp <= 0) throw new Error('XP inválido')
+  if (!Number.isFinite(creditos) || creditos < 0) throw new Error('Créditos inválidos')
+  if (!motivo) throw new Error('Motivo requerido')
+  const { rows } = await pool.query(
+    `UPDATE usuarios SET xp_total = COALESCE(xp_total, 0) + $2
+      WHERE id = $1 RETURNING xp_total`,
+    [usuarioId, xp]
+  )
+  const xp_total_nuevo = rows[0]?.xp_total ?? 0
+  let creditos_otorgados = 0
+  if (creditos > 0) {
+    await otorgarCreditos(usuarioId, creditos, 'gamificacion')
+    creditos_otorgados = creditos
+    await pool.query(
+      'INSERT INTO creditos_transacciones (usuario_id, cantidad, tipo, motivo) VALUES ($1, $2, $3, $4)',
+      [usuarioId, creditos, 'gamificacion', motivo]
+    )
+  }
+  await pool.query(
+    'INSERT INTO xp_historial (usuario_id, xp, creditos, motivo) VALUES ($1, $2, $3, $4)',
+    [usuarioId, xp, creditos_otorgados, motivo]
+  )
+  return { xp_total_nuevo, creditos_otorgados }
 }
 
 async function callOpenAIWithRetry(params, maxRetries = 2) {
@@ -1585,6 +1679,18 @@ app.get('/evaluaciones/:id/plan-estado', authenticateToken, async (req, res) => 
 // Actualizar progreso del plan
 app.post('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) => {
   const { completadas } = req.body
+  // Leemos las tareas ya completadas antes del UPDATE para calcular cuáles
+  // son nuevas y otorgar XP solo por esas. El cliente manda el array completo
+  // cada vez, así que sin este diff tildar/destildar la misma tarea daría XP
+  // infinito.
+  const { rows: prev } = await pool.query(
+    `SELECT tareas_completadas FROM evaluaciones
+      WHERE id = $1 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $2)`,
+    [req.params.id, req.user.id]
+  )
+  if (prev.length === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
+  const antes = new Set(prev[0].tareas_completadas || [])
+  const nuevasMarcadas = (Array.isArray(completadas) ? completadas : []).filter(i => !antes.has(i))
   const { rowCount } = await pool.query(
     `UPDATE evaluaciones SET tareas_completadas = $1
      WHERE id = $2 AND ramo_id IN (SELECT id FROM ramos WHERE usuario_id = $3)`,
@@ -1592,6 +1698,9 @@ app.post('/evaluaciones/:id/plan-progreso', authenticateToken, async (req, res) 
   )
   if (rowCount === 0) return res.status(404).json({ error: 'Evaluación no encontrada' })
   res.json({ ok: true })
+  for (const _ of nuevasMarcadas) {
+    otorgarXP(req.user.id, 30, 5, 'completar_tarea').catch(e => console.error('otorgarXP completar_tarea:', e.message))
+  }
 })
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
@@ -1616,8 +1725,50 @@ app.post('/auth/onboarding', authenticateToken, async (req, res) => {
 })
 
 initDB().then(() => {
-  
 
+// ── CRÉDITOS: renovación mensual ───────────────────────────────────
+// Día 1 de cada mes 00:05 (America/Santiago):
+//   1) reset creditos_gamificacion = 0 en TODOS los usuarios
+//   2) suscripción activa: asigna creditos_suscripcion según plan
+//      - 'con_distincion' → 400
+//      - 'con_distincion_maxima' → 1200
+//      - otros → 0 (y no 'aprobado' porque el plan free no tiene cupo mensual)
+//   3) fundadores: +500 en creditos_gamificacion como bono leal
+//   4) recalcula creditos_total = suscripcion + gamificacion + comprados
+// Los pasos viven en una sola transacción para que si algo revienta el saldo
+// de los usuarios no quede a medias.
+async function renovarCreditosMensual() {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const reset = await client.query('UPDATE usuarios SET creditos_gamificacion = 0')
+    const susc = await client.query(`
+      UPDATE usuarios SET creditos_suscripcion = CASE
+        WHEN plan = 'con_distincion' THEN 400
+        WHEN plan = 'con_distincion_maxima' THEN 1200
+        ELSE 0
+      END
+      WHERE suscripcion_activa = true
+    `)
+    await client.query('UPDATE usuarios SET creditos_suscripcion = 0 WHERE suscripcion_activa = false OR suscripcion_activa IS NULL')
+    const fund = await client.query(`
+      UPDATE usuarios SET creditos_gamificacion = COALESCE(creditos_gamificacion, 0) + 500
+      WHERE es_fundador = true
+    `)
+    await client.query(`
+      UPDATE usuarios SET creditos_total =
+        COALESCE(creditos_suscripcion, 0) + COALESCE(creditos_gamificacion, 0) + COALESCE(creditos_comprados, 0)
+    `)
+    await client.query('COMMIT')
+    console.log(`[cron créditos] reset gami: ${reset.rowCount} · renovó suscripciones: ${susc.rowCount} · bono fundador: ${fund.rowCount}`)
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    console.error('[cron créditos] error en renovación mensual:', err.message)
+  } finally {
+    client.release()
+  }
+}
+cron.schedule('5 0 1 * *', renovarCreditosMensual, { timezone: 'America/Santiago' })
 
 // ── NOVEDADES ─────────────────────────────────────────────────────
 // ── NOVEDADES · cache + scraping UFRO ─────────────────────────────
@@ -2695,9 +2846,11 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
       }
       
       if (bloques.length === 0) return res.status(400).json({ error: 'No se pudieron extraer bloques del archivo xlsx' })
-      return res.json({ bloques })
+      res.json({ bloques })
+      otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
+      return
     }
-    
+
     const html = req.file.buffer.toString('latin1')
 
     const dias = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado']
@@ -2746,6 +2899,7 @@ app.post('/horario/extraer-excel', authenticateToken, upload.single('archivo'), 
     if (bloques.length === 0) return res.status(400).json({ error: 'No se pudieron extraer bloques del archivo' })
     console.log('Bloques extraidos:', bloques.length, bloques)
     res.json({ bloques })
+    otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
   } catch(err) {
     console.error('Error XLS:', err)
     res.status(500).json({ error: err.message })
@@ -2800,6 +2954,7 @@ app.post('/horario/extraer', authenticateToken, upload.single('imagen'), async (
     if (!jsonMatch) return res.status(400).json({ error: 'No se pudo extraer el horario' })
     const bloques = JSON.parse(jsonMatch[0])
     res.json({ bloques })
+    otorgarXP(req.user.id, 150, 15, 'importar_horario').catch(e => console.error('otorgarXP importar_horario:', e.message))
   } catch(err) { console.error('❌ Error horario/extraer:', err); res.status(500).json({ error: err.message }) }
 })
 
@@ -4028,6 +4183,7 @@ app.post('/quiz/historial', authenticateToken, async (req, res) => {
       [req.user.id, evaluacion_id || ramo_id || null, ramo_nombre, puntaje, total, porcentaje]
     )
     res.json({ ok: true })
+    otorgarXP(req.user.id, 120, 10, 'responder_quiz').catch(e => console.error('otorgarXP responder_quiz:', e.message))
   } catch(e) { console.error('❌ Error POST /quiz/historial:', e.message); res.status(500).json({ error: e.message }) }
 })
 
