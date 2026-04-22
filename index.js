@@ -1686,6 +1686,9 @@ async function otorgarXP(usuarioId, xp, creditos, motivo) {
 // Cuentas de cobro → tu cuenta → Opciones → API → Generar API Key.
 // El receiver_id y el secret de la v2 ya no son necesarios para autenticar.
 const KHIPU_API_KEY = process.env.KHIPU_API_KEY || ''
+if (!KHIPU_API_KEY) {
+  console.warn('⚠️  KHIPU_API_KEY no configurada — los pagos fallarán en runtime')
+}
 const KHIPU_API = 'https://payment-api.khipu.com/v3'
 
 async function khipuCrearPago({ subject, amount, currency = 'CLP', returnUrl, cancelUrl, transactionId, customerId }) {
@@ -2114,6 +2117,7 @@ async function renovarCreditosMensual() {
         ELSE 0
       END
       WHERE suscripcion_activa = true
+        AND (suscripcion_vence_en IS NULL OR suscripcion_vence_en > NOW())
     `)
     await client.query('UPDATE usuarios SET creditos_suscripcion = 0 WHERE suscripcion_activa = false OR suscripcion_activa IS NULL')
     const fund = await client.query(`
