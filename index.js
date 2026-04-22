@@ -4675,6 +4675,16 @@ INSTRUCCIONES CRÍTICAS PARA UNA GUÍA ESPECTACULAR:
 - Los ejercicios deben ir de menor a mayor dificultad, con pistas inteligentes
 - El resumen debe ser una "cheat sheet" mental ultra-práctica para el día del examen
 
+IMPORTANTE: El contenido de la guía se mostrará como texto plano en la app. NO uses LaTeX ni comandos como \\frac, \\begin, \\end, \\sum, \\int, etc. En su lugar usa:
+- Fracciones: escribe '1/2' o '(a+b)/(c+d)'
+- Potencias: usa '^' o superíndice Unicode (x², y³, aⁿ)
+- Raíces: escribe '√' o 'raíz cuadrada de'
+- Matrices: usa formato de tabla simple con | separadores
+- Integrales: escribe '∫', '∑', '∏' directamente
+- Subíndices: usa '_' o subíndice Unicode (H₂O, aₙ)
+- Letras griegas: escribe directamente α, β, γ, δ, θ, λ, μ, π, σ, φ, ω
+El texto debe ser legible sin ningún renderizador de fórmulas.
+
 Responde SOLO con un JSON válido (sin markdown, sin bloques de código):
 {
   "titulo": "título atractivo y específico de la guía",
@@ -5095,6 +5105,16 @@ Contexto: ${tarea.descripcion}${materialBloque}
 - Ejercicios 8-14: MEDIOS (aplicación)
 - Ejercicios 15-20: DIFÍCILES (análisis y síntesis)
 - Cada ejercicio debe tener enunciado claro y solución detallada paso a paso
+
+IMPORTANTE: Los ejercicios se mostrarán en un PDF como texto plano. NO uses LaTeX ni comandos como \\frac, \\begin, \\end, \\sum, \\int, etc. En su lugar usa:
+- Fracciones: escribe '1/2' o '(a+b)/(c+d)'
+- Potencias: usa '^' o superíndice Unicode (x², y³, aⁿ)
+- Raíces: escribe '√' o 'raíz cuadrada de'
+- Matrices: usa formato de tabla simple con | separadores
+- Integrales: escribe '∫', '∑', '∏' directamente
+- Subíndices: usa '_' o subíndice Unicode (H₂O, aₙ)
+- Letras griegas: escribe directamente α, β, γ, δ, θ, λ, μ, π, σ, φ, ω
+El texto debe ser legible sin ningún renderizador de fórmulas.
 
 Responde SOLO con JSON válido:
 {"ejercicios":[{"numero":1,"dificultad":"fácil","enunciado":"...","solucion":"..."}]}` }],
