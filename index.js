@@ -728,6 +728,7 @@ async function initDB() {
     ALTER TABLE novedades ADD COLUMN IF NOT EXISTS expira_en TIMESTAMP;
     DELETE FROM evaluaciones WHERE nombre IS NULL OR nombre = '';
   `)
+  await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)`)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS generaciones_historial (
       id SERIAL PRIMARY KEY,
