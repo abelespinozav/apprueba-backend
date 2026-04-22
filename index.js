@@ -286,7 +286,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
         const converter = pdf2pic.fromPath(tmpPdf, { density: 300, saveFilename: 'page', savePath: os.tmpdir(), format: 'png', width: 1200, height: 1600 })
         const pages = await converter.bulk(-1, { responseType: 'base64' })
         pngFiles = pages.map(p => p.path).filter(Boolean)
-        const imagenes = pages.slice(0, 5).map(p => ({
+        const imagenes = pages.slice(0, 20).map(p => ({
           type: 'image_url',
           image_url: { url: `data:image/png;base64,${p.base64}`, detail: 'high' }
         }))
@@ -296,7 +296,7 @@ async function extraerContenido(archivo, enviar = () => {}) {
             { type: 'text', text: 'Extrae y transcribe todo el texto de estas páginas de apuntes universitarios. Incluye fórmulas, títulos, listas y todo el contenido relevante.' },
             ...imagenes
           ]}],
-          max_tokens: 4000
+          max_tokens: 16000
         })
         return resp.choices[0].message.content.slice(0, 15000)
       } finally {
