@@ -4639,6 +4639,7 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
     )
     if (archivosGuia.length > 0) {
       let textoExtraido = ''
+      const archivosGuiaFallidos = []
       for (const archivo of archivosGuia) {
         try {
           const esYoutube = archivo.tipo === 'youtube'
@@ -4647,11 +4648,27 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
             : { nombre: archivo.nombre, tipo: archivo.tipo, datos: archivo.datos }
           const contenido = await extraerContenido(archivoObj)
           textoExtraido += `\n\n--- ${archivo.nombre} ---\n${contenido}`
-        } catch(e) { console.error('Error extrayendo para guía:', e.message) }
+        } catch(e) {
+          console.error('Error extrayendo para guía:', archivo.nombre, '—', e.message)
+          archivosGuiaFallidos.push(archivo.nombre)
+        }
       }
-      if (textoExtraido.trim()) {
-        contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${textoExtraido.slice(0, 15000)}`
+      // Mismo criterio que quiz: medir contenido útil descartando solo los
+      // headers "--- nombre ---" que sobran cuando la extracción falló silent.
+      const textoUtilGuia = textoExtraido.replace(/---[^-\n]*---/g, '').trim()
+      if (textoUtilGuia.length < 100) {
+        // Refund si hubo cobro y el material es inútil — evitamos confabular
+        // una guía sobre el nombre del ramo.
+        if (guiaContadoEnLimite) {
+          await otorgarCreditos(req.user.id, 8, 'comprado').catch(()=>{})
+        }
+        return res.status(400).json({
+          error: 'sin_contenido',
+          mensaje: 'No pudimos leer el contenido de tu material. Si es un PDF escaneado, intenta subir una versión con texto seleccionable.',
+          archivos_fallidos: archivosGuiaFallidos
+        })
       }
+      contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${textoUtilGuia.slice(0, 15000)}`
     } else if (ev.texto_material && ev.texto_material.trim()) {
       contenidoArchivos = `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE (úsalo como base principal para la guía):\n${ev.texto_material.slice(0, 15000)}`
     }
@@ -4930,12 +4947,16 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
                 enviar('progreso', { msg: `📄 Leyendo: ${archivo.nombre || 'archivo'}...` })
                 const contenido = await extraerContenido(archivo, enviar)
                 textoArchivos += `\n\n--- ${archivo.nombre || archivo.youtubeUrl} ---\n${contenido}`
-              } catch(e) { console.error('Error extrayendo texto para quiz:', e.message) }
+              } catch(e) {
+                console.error('Error extrayendo texto para quiz:', e.message)
+                enviar('advertencia', { msg: `⚠️ No pudimos leer "${archivo.nombre || 'archivo'}" — continuando con el resto del material.` })
+              }
             }
           }
         }
-        if (!textoArchivos.trim()) {
-          enviar('error', { error: 'sin_contenido', mensaje: 'No se pudo extraer texto del material subido' })
+        const textoUtil = textoArchivos.replace(/---[^-\n]*---/g, '').trim()
+        if (textoUtil.length < 100) {
+          enviar('error', { error: 'sin_contenido', mensaje: 'No pudimos leer el contenido de tu material. Si es un PDF escaneado, intenta subir una versión con texto seleccionable, o sube una foto de las páginas como imagen.' })
           if (!res.destroyed) res.end()
           return
         }
@@ -4948,7 +4969,7 @@ ${perfilBloqueQuiz ? perfilBloqueQuiz + '\n\n' : ''}Ramo: ${ev.ramo_nombre}
 Evaluación: ${ev.nombre}
 
 MATERIAL DE ESTUDIO:
-${textoArchivos}
+${textoUtil}
 
 INSTRUCCIONES CRÍTICAS:
 - Genera EXACTAMENTE 20 preguntas de alternativas múltiples (A, B, C, D)
