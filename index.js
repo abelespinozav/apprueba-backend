@@ -4679,7 +4679,10 @@ IMPORTANTE: El contenido de la guía se mostrará como texto plano en la app. NO
 - Fracciones: escribe '1/2' o '(a+b)/(c+d)'
 - Potencias: usa '^' o superíndice Unicode (x², y³, aⁿ)
 - Raíces: escribe '√' o 'raíz cuadrada de'
-- Matrices: usa formato de tabla simple con | separadores
+- Matrices: represéntalas en formato visual con corchetes, una fila por línea. Ejemplo:
+  A = [1  2]
+      [3  4]
+  Usa espacios para alinear las columnas. Si la matriz es inline, escríbela como [fila1 | fila2].
 - Integrales: escribe '∫', '∑', '∏' directamente
 - Subíndices: usa '_' o subíndice Unicode (H₂O, aₙ)
 - Letras griegas: escribe directamente α, β, γ, δ, θ, λ, μ, π, σ, φ, ω
@@ -5110,7 +5113,10 @@ IMPORTANTE: Los ejercicios se mostrarán en un PDF como texto plano. NO uses LaT
 - Fracciones: escribe '1/2' o '(a+b)/(c+d)'
 - Potencias: usa '^' o superíndice Unicode (x², y³, aⁿ)
 - Raíces: escribe '√' o 'raíz cuadrada de'
-- Matrices: usa formato de tabla simple con | separadores
+- Matrices: represéntalas en formato visual con corchetes, una fila por línea. Ejemplo:
+  A = [1  2]
+      [3  4]
+  Usa espacios para alinear las columnas. Si la matriz es inline, escríbela como [fila1 | fila2].
 - Integrales: escribe '∫', '∑', '∏' directamente
 - Subíndices: usa '_' o subíndice Unicode (H₂O, aₙ)
 - Letras griegas: escribe directamente α, β, γ, δ, θ, λ, μ, π, σ, φ, ω
