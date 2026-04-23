@@ -313,6 +313,19 @@ async function extraerContenido(archivo, enviar = () => {}) {
 
   // ── DOCX ──
   if (tipo?.includes('word') || tipo?.includes('docx') || ext === 'docx' || ext === 'doc') {
+    // Detectar formato real por magic bytes
+    // .docx (OOXML/ZIP): empieza con PK\x03\x04 (50 4B 03 04)
+    // .doc (OLE binario Word 97-2003): empieza con D0 CF 11 E0
+    const esOOXML = buffer[0] === 0x50 && buffer[1] === 0x4B
+    const esOLE   = buffer[0] === 0xD0 && buffer[1] === 0xCF && buffer[2] === 0x11 && buffer[3] === 0xE0
+    if (esOLE) {
+      console.warn(`⚠️ Archivo .doc binario (OLE) rechazado: ${nombre || ext}`)
+      return '(Formato no soportado: el archivo es .doc de Word 97-2003. Por favor convierte a .docx o PDF y súbelo nuevamente.)'
+    }
+    if (!esOOXML) {
+      console.warn(`⚠️ Archivo Word con header desconocido: ${buffer.slice(0,4).toString('hex')}`)
+      return '(Formato Word no reconocido. Por favor convierte a .docx o PDF.)'
+    }
     try {
       const result = await mammoth.extractRawText({ buffer })
       console.log(`📝 DOCX extraído: ${result.value.slice(0,200)}`)
@@ -1310,6 +1323,13 @@ app.post('/evaluaciones/:id/archivos', authenticateToken, upload.single('archivo
       'INSERT INTO archivos (evaluacion_id, nombre, tipo, datos) VALUES ($1, $2, $3, $4) RETURNING id, nombre, tipo',
       [req.params.id, req.file.originalname, req.file.mimetype, req.file.buffer]
     )
+    // Bug B fix: invalidar texto_material al subir archivo nuevo para que las
+    // próximas generaciones (quiz/plan/guía/podcast/ejercicios) re-iteren los
+    // archivos en vez de usar texto stale del material viejo.
+    await pool.query(
+      'UPDATE evaluaciones SET texto_material = NULL WHERE id = $1',
+      [req.params.id]
+    ).catch(e => console.error('Error reseteando texto_material tras upload:', e.message))
     res.json(rows[0])
     otorgarXP(req.user.id, 50, 10, 'subir_material').catch(e => console.error('otorgarXP subir_material:', e.message))
     desbloquearLogro(req.user.id, 'primer_material').catch(() => {})
@@ -1893,10 +1913,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     }
     // Detectar archivos que fallaron
     const archivosConError = []
-    const textoLimpio = textoArchivos.replace(/--- Contenido de ([^-]+) ---\n\(No se pudo[^)]+\)/g, (_, nombre) => {
-      archivosConError.push(nombre.trim())
-      return ''
-    }).replace(/--- Contenido de ([^-]+) ---\n\(Formato no soportado\)/g, (_, nombre) => {
+    const textoLimpio = textoArchivos.replace(/--- Contenido de ([^-]+) ---\n\([^)]*(?:No se pudo|Formato no soportado|Formato Word)[^)]*\)/g, (_, nombre) => {
       archivosConError.push(nombre.trim())
       return ''
     }).trim()
@@ -1913,7 +1930,7 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
     const perfilBloque = formatPerfilBloque(perfil)
 
     const promptFinal = (perfilBloque ? perfilBloque + '\n\n' : '') + (textoArchivos
-      ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- NUNCA rechaces el material ni sugieras buscar otro. Usa lo que hay.`
+      ? promptText + `\n\nMATERIAL DE ESTUDIO DEL ESTUDIANTE:\n${textoArchivos}\n\nINSTRUCCIONES IMPORTANTES:\n- Debes generar el plan de estudio BASÁNDOTE EXCLUSIVAMENTE en el contenido del material subido.\n- NO importa si el material no parece relacionado con el nombre del ramo.\n- El estudiante sabe lo que necesita estudiar. Tu trabajo es crear tareas basadas en el contenido real del material.\n- Si el material contiene mensajes de error técnicos o está vacío, responde con {\"error\": \"material_insuficiente\"}.`
       : promptText)
 
     // Marcar como generando en DB
@@ -1954,6 +1971,16 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
         const jsonMatch = text.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error('No JSON')
         const plan = JSON.parse(jsonMatch[0])
+        if (plan && plan.error === 'material_insuficiente') {
+          console.log('[plan-estudio] IA rechazó material insuficiente para evaluacion', evalId)
+          clearTimeout(abortTimer)
+          await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
+          await otorgarCreditos(usuarioId, 15, 'comprado', 'refund_material_insuficiente_plan').catch(()=>{})
+          return terminar('error', {
+            error: 'material_insuficiente',
+            mensaje: plan.mensaje || 'El material que subiste no contiene contenido académico suficiente. Verifica que el archivo no esté corrupto y contenga texto legible.'
+          })
+        }
         enviar('progreso', { msg: '✅ Plan generado, guardando...' })
         await pool.query('UPDATE evaluaciones SET plan_estudio = $1, texto_material = $2, guias_tareas = NULL, plan_generando = FALSE WHERE id = $3', [JSON.stringify(plan), textoArchivos || null, evalId])
         await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
@@ -1995,6 +2022,16 @@ Genera EXACTAMENTE las tareas necesarias para cubrir TODO el contenido del mater
           const jsonMatch2 = text2.match(/\{[\s\S]*\}/)
           if (!jsonMatch2) throw new Error('No se pudo parsear respuesta de IA')
           const plan2 = JSON.parse(jsonMatch2[0])
+          if (plan2 && plan2.error === 'material_insuficiente') {
+            console.log('[plan-estudio:fallback] IA rechazó material insuficiente para evaluacion', evalId)
+            clearTimeout(abortTimer)
+            await pool.query('UPDATE evaluaciones SET plan_generando = FALSE WHERE id = $1', [evalId]).catch(()=>{})
+            await otorgarCreditos(usuarioId, 15, 'comprado', 'refund_material_insuficiente_plan').catch(()=>{})
+            return terminar('error', {
+              error: 'material_insuficiente',
+              mensaje: plan2.mensaje || 'El material que subiste no contiene contenido académico suficiente. Verifica que el archivo no esté corrupto y contenga texto legible.'
+            })
+          }
           await pool.query('UPDATE evaluaciones SET plan_estudio = $1, guias_tareas = NULL, plan_generando = FALSE WHERE id = $2', [JSON.stringify(plan2), evalId])
           await pool.query('DELETE FROM podcasts WHERE evaluacion_id = $1', [evalId])
           clearTimeout(abortTimer)
@@ -4445,8 +4482,15 @@ app.post('/evaluaciones/:id/podcast', authenticateToken, async (req, res) => {
             const parsed = { text: await extraerTextoPDF(buf) }
             material += parsed.text + ' '
           } else if (archivo.tipo && archivo.tipo.includes('word')) {
-            const result = await mammoth.extractRawText({ buffer: buf })
-            material += result.value + ' '
+            // Magic bytes: sólo procesar .docx (OOXML). Los .doc binarios
+            // (OLE D0 CF 11 E0) los saltea con warn — mammoth no los soporta.
+            const esOOXML = buf[0] === 0x50 && buf[1] === 0x4B
+            if (!esOOXML) {
+              console.warn(`⚠️ Podcast: archivo Word no-OOXML skipped: ${archivo.nombre} (header: ${buf.slice(0,4).toString('hex')})`)
+            } else {
+              const result = await mammoth.extractRawText({ buffer: buf })
+              material += result.value + ' '
+            }
           }
         } catch(e) { console.error('Error leyendo archivo:', e.message) }
       }
@@ -4656,7 +4700,7 @@ app.post('/evaluaciones/:id/guia-tarea', authenticateToken, async (req, res) => 
       // Mismo criterio que quiz: medir contenido útil descartando solo los
       // headers "--- nombre ---" que sobran cuando la extracción falló silent.
       const textoUtilGuia = textoExtraido.replace(/---[^-\n]*---/g, '').trim()
-      if (textoUtilGuia.length < 100) {
+      if (textoUtilGuia.length < 200) {
         // Refund si hubo cobro y el material es inútil — evitamos confabular
         // una guía sobre el nombre del ramo.
         if (guiaContadoEnLimite) {
@@ -4955,7 +4999,7 @@ app.post('/evaluaciones/:id/quiz', authenticateToken, async (req, res) => {
           }
         }
         const textoUtil = textoArchivos.replace(/---[^-\n]*---/g, '').trim()
-        if (textoUtil.length < 100) {
+        if (textoUtil.length < 200) {
           enviar('error', { error: 'sin_contenido', mensaje: 'No pudimos leer el contenido de tu material. Si es un PDF escaneado, intenta subir una versión con texto seleccionable, o sube una foto de las páginas como imagen.' })
           if (!res.destroyed) res.end()
           return
