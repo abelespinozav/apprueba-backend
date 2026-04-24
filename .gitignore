@@ -3,3 +3,5 @@ node_modules
 .env.backup*
 .env.*.local
 .logs/
+.local-docs/
+.backups/
